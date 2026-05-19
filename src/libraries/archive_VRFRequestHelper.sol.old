@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+import {IERC20} from "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {IVRFCoordinatorV2Plus} from "lib/foundry-chainlink-toolkit/lib/chainlink-brownie-contracts/contracts/src/v0.8/dev/interfaces/IVRFCoordinatorV2Plus.sol";
+import {VRFV2PlusClient} from "lib/foundry-chainlink-toolkit/lib/chainlink-brownie-contracts/contracts/src/v0.8/dev/vrf/libraries/VRFV2PlusClient.sol";
+import {VRFRequestLogic} from "./VRFRequestLogic.sol";
+
+library VRFRequestHelper {
+    function requestVRF(
+        address player,
+        address linkAddress,
+        IVRFCoordinatorV2Plus vrfCoordinator,
+        uint256 subscriptionId
+    ) external returns (uint256 requestId, uint256 linkFee) {
+        // With VRF V2Plus subscription model, LINK is paid from the subscription balance
+        // No need to transfer LINK from player - subscription pays automatically
+        linkFee = VRFRequestLogic.getLinkFee();
+        
+        // Optional: Still take LINK from player as a fee for using the service
+        // (This LINK stays in the game contract as revenue, not sent to VRF)
+        require(IERC20(linkAddress).transferFrom(player, address(this), linkFee), "LINK transfer failed");
+        
+        requestId = vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: VRFRequestLogic.getKeyHash(),
+                subId: subscriptionId,
+                requestConfirmations: VRFRequestLogic.getRequestConfirmations(),
+                callbackGasLimit: VRFRequestLogic.getCallbackGasLimit(),
+                numWords: VRFRequestLogic.getNumWords(),
+                extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
+            })
+        );
+    }
+    
+    function requestDealerHoleCard(
+        address player,
+        address linkAddress,
+        IVRFCoordinatorV2Plus vrfCoordinator,
+        uint256 subscriptionId
+    ) external returns (uint256 requestId, uint256 linkFee) {
+        // With VRF V2Plus subscription model, LINK is paid from the subscription balance
+        // No need to transfer LINK from player - subscription pays automatically
+        linkFee = VRFRequestLogic.getLinkFee();
+        
+        // Optional: Still take LINK from player as a fee for using the service
+        // (This LINK stays in the game contract as revenue, not sent to VRF)
+        require(IERC20(linkAddress).transferFrom(player, address(this), linkFee), "LINK transfer failed");
+        
+        requestId = vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: VRFRequestLogic.getKeyHash(),
+                subId: subscriptionId,
+                callbackGasLimit: 300000,
+                requestConfirmations: 3,
+                numWords: 1,
+                extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
+            })
+        );
+    }
+}

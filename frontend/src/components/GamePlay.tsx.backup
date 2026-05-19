@@ -1,0 +1,2215 @@
+"use client";
+
+import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt, useWatchContractEvent, usePublicClient } from "wagmi";
+import { GAME_ABI, LINK_TOKEN_ABI, FACTORY_ABI, GAME_TOKEN_ABI } from "@/lib/abis";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { PlayingCard } from "./PlayingCard";
+import { useGameTransaction } from "@/hooks/useGameTransaction";
+import { Fireworks } from "./Fireworks";
+import { VRFStatusDisplay } from "./VRFStatusDisplay";
+import { formatUnits } from "viem";
+import { calculateGameOutcome, canCalculateOutcome, type PlayerHand } from "@/lib/gameOutcomeCalculator";
+
+const LINK_TOKEN_ADDRESS = process.env.NEXT_PUBLIC_LINK_TOKEN as `0x${string}`;
+const FACTORY_ADDRESS = process.env.NEXT_PUBLIC_FACTORY_ADDRESS as `0x${string}`;
+const GAME_TOKEN_ADDRESS = process.env.NEXT_PUBLIC_GAME_TOKEN_ADDRESS as `0x${string}`;
+
+type GamePlayProps = {
+  gameAddress: `0x${string}`;
+  onMinimize?: () => void;
+};
+
+// Game states from contract
+enum GameState {
+  NotStarted = 0,
+  Dealing = 1,
+  InsuranceOffer = 2,
+  PlayerTurn = 3,
+  DealerTurn = 4,
+  Finished = 5,
+}
+
+export function GamePlay({ gameAddress, onMinimize }: GamePlayProps) {
+  const { address } = useAccount();
+  const [placedInsuranceAmount, setPlacedInsuranceAmount] = useState<bigint>(BigInt(0)); // Track actual insurance placed
+  const [txError, setTxError] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null); // Track action to execute after approval
+  const [currentAction, setCurrentAction] = useState<string | null>(null); // Track currently executing action
+  const [recentlySplitHand, setRecentlySplitHand] = useState<number | null>(null); // Track which hand was just split to prevent duplicate splits
+  const [approvalPhase, setApprovalPhase] = useState<"none" | "link" | "token">("none"); // Track which approval is in progress
+  const [gameResult, setGameResult] = useState<{ result: string; payout: bigint } | null>(null);
+  const [dealerHoleCardRevealed, setDealerHoleCardRevealed] = useState(false); // Track if dealer's 2nd card has been revealed
+  const [showFireworks, setShowFireworks] = useState(false);
+  const [lastKnownDealerCards, setLastKnownDealerCards] = useState<bigint[]>([]); // Preserve dealer cards during VRF
+  const publicClient = usePublicClient();
+  
+  // Track if we've already triggered dealer hit for current dealer turn to prevent duplicate calls
+  const dealerHitTriggeredRef = useRef(false);
+  
+  // Track the action being executed so we can reference it in onSuccess (since currentAction state might be stale)
+  const executingActionRef = useRef<string | null>(null);
+  
+  // Track fallback event fetch attempts to prevent infinite retries
+  const fetchAttemptsRef = useRef(0);
+  const maxFetchAttempts = 5;
+  
+  // Track current state values for event watchers (to avoid stale closures)
+  const isPendingRef = useRef(false);
+  const currentActionRef = useRef<string | null>(null);
+  const pendingActionRef = useRef<string | null>(null);
+
+  // Track which cards have been "seen" to trigger animations only on initial deal
+  const [seenDealerCardCount, setSeenDealerCardCount] = useState(0);
+  const [seenPlayerCardCounts, setSeenPlayerCardCounts] = useState<number[]>([0, 0, 0, 0]);
+  // Track if dealer's first card should flip (set to true after card has mounted and second card arrives)
+  const [dealerFirstCardShouldFlip, setDealerFirstCardShouldFlip] = useState(false);
+
+  // Watch for GameFinished event
+  useWatchContractEvent({
+    address: gameAddress,
+    abi: GAME_ABI,
+    eventName: "GameFinished",
+    onLogs(logs) {
+      console.log("GameFinished event received:", logs);
+      if (logs && logs.length > 0) {
+        const log = logs[logs.length - 1]; // Get the most recent event
+        setGameResult({
+          result: log.args.result as string,
+          payout: log.args.payout as bigint,
+        });
+      }
+    },
+  });
+
+  // Watch for DealerNeedsToHit event - automatically call dealerHit() when dealer needs another card
+  useWatchContractEvent({
+    address: gameAddress,
+    abi: GAME_ABI,
+    eventName: "DealerNeedsToHit",
+    onLogs(logs) {
+      console.log("🎲 DealerNeedsToHit event received:", logs);
+      if (logs && logs.length > 0) {
+        // Wait for any pending transaction to complete, then call dealerHit
+        // We retry with exponential backoff to handle race conditions
+        // where the transaction that emitted this event might still be pending
+        const attemptDealerHit = (attemptNumber: number = 0) => {
+          const maxAttempts = 10;
+          const delay = Math.min(100 * Math.pow(1.5, attemptNumber), 2000); // 100ms, 150ms, 225ms, ... max 2s
+          
+          setTimeout(() => {
+            // Use refs instead of state to avoid stale closure values
+            const currentlyPending = isPendingRef.current;
+            const currentlyExecuting = currentActionRef.current;
+            const currentlyPendingAction = pendingActionRef.current;
+            
+            if (!currentlyPending && !currentlyExecuting && !currentlyPendingAction) {
+              console.log(`🎲 Auto-calling dealerHit() (attempt ${attemptNumber + 1})`);
+              console.log("🔗 LINK approval status:", { isLINKApproved, linkAllowance, linkFeePerAction });
+              
+              // Check if LINK is approved first
+              if (!isLINKApproved) {
+                console.log("🔗 Need to approve LINK before dealerHit - calling handleApproveLINK");
+                handleApproveLINK("dealerHit");
+              } else {
+                console.log("✅ LINK approved, calling execute('dealerHit')");
+                execute("dealerHit");
+              }
+            } else if (attemptNumber < maxAttempts - 1) {
+              console.log(`⏳ Retry ${attemptNumber + 1}/${maxAttempts} - still pending:`, { 
+                isPending: currentlyPending, 
+                currentAction: currentlyExecuting, 
+                pendingAction: currentlyPendingAction 
+              });
+              attemptDealerHit(attemptNumber + 1);
+            } else {
+              console.log("⚠️ Max retries reached for dealerHit(), giving up", { 
+                isPending: currentlyPending, 
+                currentAction: currentlyExecuting, 
+                pendingAction: currentlyPendingAction 
+              });
+            }
+          }, delay);
+        };
+        
+        attemptDealerHit(0);
+      }
+    },
+  });
+
+  // Read LINK fee per action from factory contract
+  const { data: factoryConfig } = useReadContract({
+    address: FACTORY_ADDRESS,
+    abi: FACTORY_ABI,
+    functionName: "getConfig",
+  });
+
+  // Extract linkFee from factory config
+  const linkFeePerAction = factoryConfig ? factoryConfig[2] : BigInt(0); // linkFee is the 3rd return value
+
+  // Read game state with auto-refetch
+  const { data: gameState, refetch } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "state",
+    query: {
+      refetchInterval: 2000, // Refetch every 2 seconds
+    },
+  });
+
+  const { data: currentHandIndex } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "currentHand",
+    query: {
+      refetchInterval: 2000,
+    },
+  });
+
+  const { data: playerHandsLength } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandsLength",
+    query: {
+      refetchInterval: 2000,
+    },
+  });
+
+  // Dynamically fetch all player hands
+  const numHands = Number(playerHandsLength || 1);
+  
+  const { data: playerHand0Cards } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandCards",
+    args: [BigInt(0)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 1,
+    },
+  });
+
+  const { data: playerHand0Bet } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandBet",
+    args: [BigInt(0)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 1,
+    },
+  });
+
+  // Hand 1 (only fetch if split occurred)
+  const { data: playerHand1Cards } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandCards",
+    args: [BigInt(1)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 2,
+    },
+  });
+
+  const { data: playerHand1Bet } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandBet",
+    args: [BigInt(1)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 2,
+    },
+  });
+
+  // Hand 2 (if double split)
+  const { data: playerHand2Cards } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandCards",
+    args: [BigInt(2)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 3,
+    },
+  });
+
+  const { data: playerHand2Bet } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandBet",
+    args: [BigInt(2)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 3,
+    },
+  });
+
+  // Hand 3 (max hands)
+  const { data: playerHand3Cards } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandCards",
+    args: [BigInt(3)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 4,
+    },
+  })
+
+;
+
+  const { data: playerHand3Bet } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getPlayerHandBet",
+    args: [BigInt(3)],
+    query: {
+      refetchInterval: 2000,
+      enabled: numHands >= 4,
+    },
+  });
+
+  const { data: dealerCardsData } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "getDealerCards",
+    query: {
+      refetchInterval: 2000,
+    },
+  });
+
+  // Check LINK allowance for this game contract
+  const { data: linkAllowance, refetch: refetchLinkAllowance } = useReadContract({
+    address: LINK_TOKEN_ADDRESS,
+    abi: LINK_TOKEN_ABI,
+    functionName: "allowance",
+    args: address ? [address, gameAddress] : undefined,
+    query: {
+      refetchInterval: 3000,
+    },
+  });
+
+  // Approve LINK for the game contract
+  const { 
+    writeContract: approveLINK, 
+    data: approveTxHash, 
+    isPending: isApprovingLINK,
+    error: approveError 
+  } = useWriteContract();
+  
+  const { isSuccess: isApproveSuccess, isError: isApproveError } = useWaitForTransactionReceipt({
+    hash: approveTxHash,
+  });
+
+  // Log LINK approval errors
+  useEffect(() => {
+    if (approveError) {
+      console.error("=== LINK APPROVAL WRITE ERROR ===");
+      console.error("Error details:", approveError);
+      setTxError(`LINK approval failed: ${approveError.message}`);
+      setPendingAction(null);
+      setApprovalPhase("none");
+    }
+  }, [approveError, setTxError]);
+
+  useEffect(() => {
+    if (isApproveError) {
+      console.error("=== LINK APPROVAL TRANSACTION RECEIPT ERROR ===");
+      console.error("The LINK approval transaction was sent but failed on-chain");
+      setTxError("LINK approval transaction failed on-chain. Please check your transaction in the block explorer.");
+      setPendingAction(null);
+      setApprovalPhase("none");
+    }
+  }, [isApproveError, setTxError]);
+
+  const handleApproveLINK = async (action: string) => {
+    if (!linkFeePerAction) return;
+    try {
+      setPendingAction(action); // Store the action to execute after approval
+      setApprovalPhase("link"); // Mark that we're in LINK approval phase
+      // Approve enough for many actions (100 actions worth)
+      const approvalAmount = linkFeePerAction * BigInt(100);
+      
+      // Set gas prices explicitly to meet Polygon Amoy minimum requirements
+      // The network requires at least 25 Gwei for maxPriorityFeePerGas
+      // We set both values to 30 Gwei to ensure we're above the minimum
+      const minGasPrice = BigInt(30_000_000_000); // 30 Gwei in wei
+      
+      approveLINK({
+        address: LINK_TOKEN_ADDRESS,
+        abi: LINK_TOKEN_ABI,
+        functionName: "approve",
+        args: [gameAddress, approvalAmount],
+        maxPriorityFeePerGas: minGasPrice,
+        maxFeePerGas: minGasPrice * BigInt(2), // Set maxFeePerGas to 2x priority fee
+      });
+    } catch (err) {
+      console.error("LINK approval error:", err);
+      setTxError("Failed to approve LINK");
+      setPendingAction(null);
+      setApprovalPhase("none");
+    }
+  };
+
+  // Check if LINK is approved for at least one more action
+  const isLINKApproved = linkAllowance && linkFeePerAction && linkAllowance >= linkFeePerAction;
+
+  // Read insurance bet from contract (more reliable than React state)
+  // Note: insuranceBet is a public state variable, which auto-generates a getter function
+  const { data: contractInsuranceBet, isLoading: isLoadingInsuranceBet, error: insuranceBetError } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "insuranceBet",
+    query: {
+      enabled: !!gameAddress,
+      refetchInterval: 1000, // Check every second for faster updates
+    },
+  });
+
+  // Log contract insurance bet value for debugging
+  useEffect(() => {
+    console.log("📋 Contract insurance bet updated:", {
+      contractInsuranceBet: contractInsuranceBet?.toString(),
+      contractInsuranceBetBJT: contractInsuranceBet ? (Number(contractInsuranceBet) / 1e18).toFixed(2) : "0",
+      isLoadingInsuranceBet,
+      insuranceBetError: insuranceBetError?.message,
+      placedInsuranceAmount: placedInsuranceAmount.toString(),
+      placedInsuranceAmountBJT: (Number(placedInsuranceAmount) / 1e18).toFixed(2),
+      willUse: contractInsuranceBet ? "CONTRACT" : "STATE (fallback)",
+    });
+  }, [contractInsuranceBet, placedInsuranceAmount, isLoadingInsuranceBet, insuranceBetError]);
+
+  // Read final payout from contract (set when game finishes, reliable after reloads)
+  const { data: contractFinalPayout } = useReadContract({
+    address: gameAddress,
+    abi: GAME_ABI,
+    functionName: "finalPayout",
+    query: {
+      enabled: !!gameAddress,
+      refetchInterval: 2000, // Check every 2 seconds
+    },
+  });
+
+  // Check GameToken allowance for this game contract
+  const { data: tokenAllowance, refetch: refetchTokenAllowance } = useReadContract({
+    address: GAME_TOKEN_ADDRESS,
+    abi: GAME_TOKEN_ABI,
+    functionName: "allowance",
+    args: address ? [address, gameAddress] : undefined,
+    query: {
+      refetchInterval: 3000,
+    },
+  });
+
+  // Approve GameToken for the game contract
+  const { 
+    writeContract: approveToken, 
+    data: approveTokenTxHash, 
+    isPending: isApprovingToken,
+    error: approveTokenError 
+  } = useWriteContract();
+  
+  const { isSuccess: isTokenApproveSuccess, isError: isTokenApproveError } = useWaitForTransactionReceipt({
+    hash: approveTokenTxHash,
+  });
+
+  // Log when approval transaction hash is received
+  useEffect(() => {
+    if (approveTokenTxHash) {
+      console.log("=== TOKEN APPROVAL TX HASH RECEIVED ===");
+      console.log(`Transaction hash: ${approveTokenTxHash}`);
+      console.log("Waiting for transaction confirmation...");
+    }
+  }, [approveTokenTxHash]);
+
+  // Log when approval succeeds
+  useEffect(() => {
+    if (isTokenApproveSuccess) {
+      console.log("=== TOKEN APPROVAL SUCCESS ===");
+      console.log(`Transaction hash: ${approveTokenTxHash}`);
+      console.log("Approval confirmed on-chain!");
+    }
+  }, [isTokenApproveSuccess, approveTokenTxHash]);
+
+  // Log approval errors
+  useEffect(() => {
+    if (approveTokenError) {
+      console.error("=== TOKEN APPROVAL WRITE ERROR ===");
+      console.error("Error details:", approveTokenError);
+      console.error("Error message:", approveTokenError.message);
+      console.error("Error cause:", approveTokenError.cause);
+      setTxError(`Token approval failed: ${approveTokenError.message}`);
+      setPendingAction(null);
+      setApprovalPhase("none");
+    }
+  }, [approveTokenError, setTxError]);
+
+  useEffect(() => {
+    if (isTokenApproveError) {
+      console.error("=== TOKEN APPROVAL TRANSACTION RECEIPT ERROR ===");
+      console.error("The approval transaction was sent but failed on-chain");
+      setTxError("Token approval transaction failed on-chain. Please check your transaction in the block explorer.");
+      setPendingAction(null);
+      setApprovalPhase("none");
+    }
+  }, [isTokenApproveError, setTxError]);
+
+  const handleApproveToken = async (action: string, amount: bigint) => {
+    try {
+      setPendingAction(action); // Store the action to execute after approval
+      setApprovalPhase("token"); // Mark that we're in token approval phase
+      // Approve the specific amount needed (or a bit more for buffer)
+      const approvalAmount = amount * BigInt(2); // 2x buffer
+      console.log("=== STARTING TOKEN APPROVAL ===");
+      console.log(`Action: ${action}`);
+      console.log(`Amount needed: ${amount.toString()}`);
+      console.log(`Approving: ${approvalAmount.toString()} tokens (${amount.toString()} * 2) for game ${gameAddress}`);
+      console.log(`GameToken address: ${GAME_TOKEN_ADDRESS}`);
+      console.log(`Current allowance: ${tokenAllowance?.toString() || '0'}`);
+      console.log(`Player address: ${address}`);
+      
+      approveToken({
+        address: GAME_TOKEN_ADDRESS,
+        abi: GAME_TOKEN_ABI,
+        functionName: "approve",
+        args: [gameAddress, approvalAmount],
+      });
+      
+      console.log("Approval transaction sent to MetaMask, waiting for user confirmation...");
+    } catch (err) {
+      console.error("Token approval error:", err);
+      setTxError(`Failed to approve tokens: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      setPendingAction(null);
+      setApprovalPhase("none");
+    }
+  };
+
+  // Check if tokens are approved for a specific amount
+  const isTokenApprovedFor = (amount: bigint) => {
+    return tokenAllowance && tokenAllowance >= amount;
+  };
+
+  // Transaction handler with gas optimization and simulation
+  // Memoize callbacks to prevent execute function from changing on every render
+  const onSuccess = useCallback(() => {
+    refetch();
+    setTxError(null);
+    // If we just completed a split action, mark the current hand as recently split
+    // Use ref instead of state since state might be stale in this callback
+    if (executingActionRef.current === "split") {
+      console.log("🔄 Split action completed, setting recentlySplitHand flag");
+      setRecentlySplitHand(0); // Mark that a split just happened
+      // Clear this flag after a delay to allow state to refetch
+      setTimeout(() => {
+        console.log("🔄 Clearing recentlySplitHand flag after timeout");
+        setRecentlySplitHand(null);
+      }, 3000); // Increased to 3 seconds to ensure state has time to update
+    }
+    setCurrentAction(null); // Clear current action on success
+    executingActionRef.current = null; // Clear the ref
+  }, [refetch]);
+
+  const onError = useCallback((err: Error) => {
+    setTxError(err.message);
+    setCurrentAction(null); // Clear current action on error
+    executingActionRef.current = null; // Clear the ref
+  }, []);
+
+  const { execute: executeRaw, isPending, hash, error } = useGameTransaction({
+    gameAddress,
+    abi: GAME_ABI,
+    onSuccess,
+    onError,
+  });
+  
+  // Sync state to refs so event watchers can access current values without stale closures
+  useEffect(() => {
+    isPendingRef.current = isPending;
+  }, [isPending]);
+  
+  useEffect(() => {
+    currentActionRef.current = currentAction;
+  }, [currentAction]);
+  
+  useEffect(() => {
+    pendingActionRef.current = pendingAction;
+  }, [pendingAction]);
+
+  // Parse game state early for hooks
+  const state = gameState ? Number(gameState) : 0;
+  const currentHand = Number(currentHandIndex || 0);
+  const dealerCardsFromContract = Array.isArray(dealerCardsData) ? dealerCardsData.map(c => BigInt(c)) : [];
+  
+  // Create stable hash of dealer cards for dependency tracking
+  const dealerCardsHash = dealerCardsFromContract.length > 0 
+    ? dealerCardsFromContract.map(c => c.toString()).join('-') 
+    : '';
+  const cachedCardsHash = lastKnownDealerCards.length > 0
+    ? lastKnownDealerCards.map(c => c.toString()).join('-')
+    : '';
+  
+  // Preserve dealer cards during VRF requests to prevent visual reset
+  // CRITICAL RULE: Once we have N dealer cards, we NEVER accept fewer than N cards from contract
+  // unless the game state is NotStarted (indicating a fresh game)
+  useEffect(() => {
+    const contractCardCount = dealerCardsFromContract.length;
+    const cachedCardCount = lastKnownDealerCards.length;
+    const isNotStarted = state === GameState.NotStarted;
+    
+    // Log every time the effect runs to debug
+    console.log(`[Dealer Cards Effect] State: ${GameState[state]}, Contract: [${dealerCardsFromContract.join(', ')}] (${contractCardCount}), Cached: [${lastKnownDealerCards.join(', ')}] (${cachedCardCount})`);
+    
+    // RESET on new game: Clear cache when game is NotStarted
+    if (isNotStarted && cachedCardCount > 0) {
+      console.log(`🔄 Resetting dealer cards for new game`);
+      setLastKnownDealerCards([]);
+      return;
+    }
+    
+    // Case 1: We have MORE cards from contract - always update (new card added)
+    if (contractCardCount > cachedCardCount) {
+      console.log(`✅ Case 1: Dealer got new card(s): ${cachedCardCount} -> ${contractCardCount}`);
+      console.log(`  New cards: [${dealerCardsFromContract.join(', ')}]`);
+      setLastKnownDealerCards(dealerCardsFromContract);
+      return;
+    }
+    
+    // Case 2: We have FEWER cards from contract - IGNORE UNLESS it's a clear new game
+    if (contractCardCount < cachedCardCount) {
+      if (contractCardCount === 1 && isNotStarted) {
+        // This is a new game starting with 1 card
+        console.log(`✅ Case 2a: New game starting with 1 dealer card`);
+        setLastKnownDealerCards(dealerCardsFromContract);
+      } else {
+        // Contract returning old state during VRF - IGNORE
+        console.log(`🚫 Case 2b: IGNORING contract data with fewer cards (${contractCardCount} < ${cachedCardCount}) - likely VRF in progress`);
+        console.log(`   Keeping cached cards: [${lastKnownDealerCards.join(', ')}]`);
+      }
+      return;
+    }
+    
+    // Case 3: SAME number of cards - check if content changed
+    if (contractCardCount === cachedCardCount && contractCardCount > 0) {
+      const cardsChanged = dealerCardsFromContract.some((card, i) => card !== lastKnownDealerCards[i]);
+      if (cardsChanged) {
+        // Cards changed but count is same - could be VRF replacing cards
+        // Only update if we have MORE information (e.g., hole card revealed)
+        console.log(`⚠️ Case 3: Dealer cards content CHANGED (same count ${contractCardCount})`);
+        console.log(`  Old: [${lastKnownDealerCards.join(', ')}]`);
+        console.log(`  New: [${dealerCardsFromContract.join(', ')}]`);
+        
+        // Only update if this looks like a legitimate change (e.g., card values increased)
+        // Check if any card ID is larger - indicates new cards, not old state
+        const hasLargerCard = dealerCardsFromContract.some((card, i) => {
+          const oldCard = lastKnownDealerCards[i];
+          return oldCard === BigInt(0) || card > oldCard;
+        });
+        
+        if (hasLargerCard || contractCardCount === 2) {
+          console.log(`  ✅ Updating (has larger card ID or hole card)`);
+          setLastKnownDealerCards(dealerCardsFromContract);
+        } else {
+          console.log(`  🚫 IGNORING (appears to be old state)`);
+        }
+      } else {
+        console.log(`✓ Case 3: Cards unchanged (${contractCardCount} cards)`);
+      }
+      return;
+    }
+    
+    // Case 4: Contract returns 0 cards but we have cached cards - keep cached cards
+    if (contractCardCount === 0 && cachedCardCount > 0) {
+      console.log(`🔒 Case 4: Keeping cached dealer cards during VRF wait (${cachedCardCount} cards)`);
+      return;
+    }
+    
+    // Case 5: First render with cards from contract
+    if (contractCardCount > 0 && cachedCardCount === 0) {
+      console.log(`✅ Case 5: Initial dealer cards: ${contractCardCount} cards`);
+      console.log(`  Cards: [${dealerCardsFromContract.join(', ')}]`);
+      setLastKnownDealerCards(dealerCardsFromContract);
+      return;
+    }
+    
+    // Case 6: Both empty - nothing to do
+    if (contractCardCount === 0 && cachedCardCount === 0) {
+      console.log(`⏸️ Case 6: No cards yet (waiting for game to start)`);
+    }
+  }, [dealerCardsFromContract.length, dealerCardsHash, lastKnownDealerCards.length, cachedCardsHash, state]);
+  
+  // Always use cached cards as the source of truth
+  // Fall back to contract data only if we have no cached cards yet
+  const dealerCards = lastKnownDealerCards.length > 0 ? lastKnownDealerCards : dealerCardsFromContract;
+  
+  console.log(`[Render] Using dealer cards: [${dealerCards.join(', ')}] (${dealerCards.length} cards)`);
+
+  // Track initial card count on mount to distinguish between cards already present vs newly dealt
+  const initialDealerCardCount = useRef<number | null>(null);
+  const initialPlayerCardCounts = useRef<number[] | null>(null);
+
+  // Set initial counts on first render with cards (so we don't animate cards that were already there)
+  useEffect(() => {
+    // Special case: If game is NotStarted and we have no initial count, set it to 0
+    // This means we're starting fresh and should animate all cards
+    if (state === GameState.NotStarted && initialDealerCardCount.current === null) {
+      console.log(`🎴 Game is NotStarted - setting initial dealer count to 0 (will animate all cards)`);
+      initialDealerCardCount.current = 0;
+      return;
+    }
+    
+    // For Dealing state, if initial count is null, record the count once cards arrive
+    // This handles the initial deal - cards that appear during Dealing are from VRF, should NOT animate
+    if (state === GameState.Dealing && initialDealerCardCount.current === null && dealerCards.length > 0) {
+      console.log(`🎴 Game is Dealing - setting initial dealer count to ${dealerCards.length} (initial deal, no animation)`);
+      initialDealerCardCount.current = dealerCards.length;
+      return;
+    }
+    
+    // For PlayerTurn/DealerTurn/Finished states ONLY:
+    // If we have cards and no initial count, this is a page refresh/reload
+    // Record the current count so we don't animate existing cards
+    if (initialDealerCardCount.current === null && dealerCards.length > 0) {
+      // Only set initial count if we're not in the middle of a game starting
+      // If state is PlayerTurn but we have 0 cards initially, this means cards are being dealt NOW
+      if (state !== GameState.PlayerTurn || dealerCards.length > 1) {
+        console.log(`🎴 Setting initial dealer card count: ${dealerCards.length} (page load/refresh, state=${GameState[state]})`);
+        initialDealerCardCount.current = dealerCards.length;
+      } else {
+        console.log(`🎴 PlayerTurn with first dealer card - setting initial to 0 to enable animation`);
+        initialDealerCardCount.current = 0;
+      }
+    }
+  }, [dealerCards.length, state]);
+
+  // Track when dealer gets NEW cards (beyond initial count) for fade/flip animations
+  useEffect(() => {
+    console.log(`🎴 Card tracking effect: initialCount=${initialDealerCardCount.current}, currentCount=${dealerCards.length}, seenCount=${seenDealerCardCount}, state=${GameState[state]}, dealerFirstCardShouldFlip=${dealerFirstCardShouldFlip}`);
+    
+    // Skip if we haven't set initial count yet
+    if (initialDealerCardCount.current === null) {
+      console.log(`🎴 Skipping - initial count not set yet`);
+      return;
+    }
+    
+    const currentCount = dealerCards.length;
+    const initialCount = initialDealerCardCount.current;
+    
+    // Only update if we have MORE cards than the initial count (new cards added during gameplay)
+    // seenDealerCardCount tracks cards added AFTER the initial load
+    if (currentCount > initialCount && seenDealerCardCount < (currentCount - initialCount)) {
+      const newSeenCount = currentCount - initialCount;
+      console.log(`🎴🎴🎴 Dealer got new card(s) during gameplay! Initial: ${initialCount}, Current: ${currentCount}, Newly added: ${newSeenCount}, Cards: [${dealerCards.join(', ')}]`);
+      setSeenDealerCardCount(newSeenCount);
+    }
+    
+    // If dealer cards went from something to zero (game reset), ensure flip state is reset
+    if (currentCount === 0 && dealerFirstCardShouldFlip) {
+      console.log(`🎴 Dealer cards cleared, resetting dealerFirstCardShouldFlip`);
+      setDealerFirstCardShouldFlip(false);
+    }
+  }, [dealerCards.length, seenDealerCardCount, state, dealerFirstCardShouldFlip]);
+
+  // Separate effect to trigger flip animation when first card arrives
+  // This runs AFTER the seenDealerCardCount is updated in the previous effect
+  // We use DOUBLE RAF to ensure the card renders first before triggering the flip
+  useEffect(() => {
+    // When first card arrives (seenCount becomes 1) and flip not yet triggered
+    if (seenDealerCardCount === 1 && !dealerFirstCardShouldFlip && dealerCards.length > 0) {
+      console.log(`🎴🎴🎴 First card detected (seenCount=1), scheduling flip animation! Card: ${dealerCards[0]}`);
+      // Double RAF: ensures the card renders with shouldFlip={false} first, then we can trigger the flip
+      requestAnimationFrame(() => {
+        console.log(`🎴 RAF 1: Card should be rendered now`);
+        requestAnimationFrame(() => {
+          console.log(`🎴 RAF 2: Now triggering dealerFirstCardShouldFlip=true`);
+          setDealerFirstCardShouldFlip(true);
+        });
+      });
+    }
+  }, [seenDealerCardCount, dealerFirstCardShouldFlip, dealerCards.length, dealerCards[0]]);
+
+  // Reset seen cards when game is NotStarted (new game)
+  useEffect(() => {
+    if (state === GameState.NotStarted) {
+      setSeenDealerCardCount(0);
+      setSeenPlayerCardCounts([0, 0, 0, 0]);
+      setDealerFirstCardShouldFlip(false);
+      initialDealerCardCount.current = null; // Reset so we can set new initial count
+      initialPlayerCardCounts.current = null;
+      console.log('🎴 Resetting seen card counts for new game');
+    }
+  }, [state]);
+
+  // Get player card counts early for animation tracking (before early return)
+  const playerCardCounts = [
+    Array.isArray(playerHand0Cards) ? playerHand0Cards.length : 0,
+    Array.isArray(playerHand1Cards) ? playerHand1Cards.length : 0,
+    Array.isArray(playerHand2Cards) ? playerHand2Cards.length : 0,
+    Array.isArray(playerHand3Cards) ? playerHand3Cards.length : 0,
+  ];
+
+  // Set initial player card counts on first render (so we don't animate cards that were already there)
+  useEffect(() => {
+    // Special case: If game is NotStarted and we have no initial counts, set them to [0,0,0,0]
+    // This means we're starting fresh and should animate all cards
+    if (state === GameState.NotStarted && initialPlayerCardCounts.current === null) {
+      console.log(`🎴 Game is NotStarted - setting initial player counts to [0,0,0,0] (will animate all cards)`);
+      initialPlayerCardCounts.current = [0, 0, 0, 0];
+      return;
+    }
+    
+    // For other states, if we have cards and no initial counts, record the current counts
+    // This handles page refresh - we don't want to animate cards that already exist
+    if (initialPlayerCardCounts.current === null && playerCardCounts.some(count => count > 0)) {
+      console.log(`🎴 Setting initial player card counts: [${playerCardCounts.join(', ')}] (these won't animate - page load/refresh)`);
+      initialPlayerCardCounts.current = [...playerCardCounts];
+    }
+  }, [playerCardCounts[0], playerCardCounts[1], playerCardCounts[2], playerCardCounts[3], state]);
+
+  // Track when player hands get NEW cards (beyond initial count) for fade animations
+  useEffect(() => {
+    // Skip if we haven't set initial counts yet
+    if (initialPlayerCardCounts.current === null) return;
+    
+    const newCounts = [...seenPlayerCardCounts];
+    let changed = false;
+    
+    playerCardCounts.forEach((count, index) => {
+      const initialCount = initialPlayerCardCounts.current![index];
+      const currentSeenCount = seenPlayerCardCounts[index];
+      
+      // Track cards added AFTER initial load
+      // seenPlayerCardCounts[i] represents how many cards were added to hand i after page load
+      const newlyAddedCards = count - initialCount;
+      
+      if (newlyAddedCards > currentSeenCount) {
+        console.log(`🎴 Player hand ${index} got new card(s) during gameplay! Initial: ${initialCount}, Current: ${count}, Newly added: ${newlyAddedCards}`);
+        newCounts[index] = newlyAddedCards;
+        changed = true;
+      }
+    });
+    
+    if (changed) {
+      setSeenPlayerCardCounts(newCounts);
+    }
+  }, [playerCardCounts[0], playerCardCounts[1], playerCardCounts[2], playerCardCounts[3], 
+      seenPlayerCardCounts[0], seenPlayerCardCounts[1], seenPlayerCardCounts[2], seenPlayerCardCounts[3]]);
+
+  // Wrapper to prevent execution if game is finished or in wrong state
+  const execute = useCallback((functionName: string, args?: any[], value?: bigint) => {
+    // Don't execute if game is finished (unless it's a special case like starting a new game)
+    if (state === GameState.Finished && functionName !== "startGame") {
+      console.log(`Prevented ${functionName} execution - game is finished`);
+      // Don't set error for dealerHit or continueDealer since they might be automated
+      if (functionName !== "dealerHit" && functionName !== "continueDealer") {
+        setTxError("Cannot perform action - game is finished");
+      }
+      return;
+    }
+    
+    // Validate game state for player actions
+    const isPlayerTurnAction = ["hit", "stand", "doubleDown", "split"].includes(functionName);
+    const isInsuranceAction = functionName === "placeInsurance" || functionName === "skipInsurance";
+    const isSurrender = functionName === "surrender";
+    const isDealerAction = functionName === "dealerHit" || functionName === "continueDealer";
+    
+    if (isPlayerTurnAction && state !== GameState.PlayerTurn) {
+      console.log(`Prevented ${functionName} execution - not in PlayerTurn state (current: ${GameState[state]})`);
+      setTxError(`Cannot ${functionName} - game state changed to ${GameState[state]}. Please wait for your turn.`);
+      return;
+    }
+    
+    if (isInsuranceAction && state !== GameState.InsuranceOffer) {
+      console.log(`Prevented ${functionName} execution - not in InsuranceOffer state (current: ${GameState[state]})`);
+      setTxError(`Cannot perform insurance action - game state changed to ${GameState[state]}.`);
+      return;
+    }
+    
+    if (isSurrender && state !== GameState.PlayerTurn && state !== GameState.InsuranceOffer) {
+      console.log(`Prevented surrender execution - wrong state (current: ${GameState[state]})`);
+      setTxError(`Cannot surrender - game state changed to ${GameState[state]}.`);
+      return;
+    }
+    
+    if (isDealerAction && state !== GameState.DealerTurn) {
+      console.log(`Prevented ${functionName} execution - not in DealerTurn state (current: ${GameState[state]})`);
+      // Don't show error to user since this might be automated
+      return;
+    }
+    
+    // Set current action before executing (both in state and ref)
+    setCurrentAction(functionName);
+    executingActionRef.current = functionName;
+    executeRaw(functionName, args, value);
+  }, [state, executeRaw, setTxError]);
+
+  // Refetch token allowance after successful approval and execute pending action
+  useEffect(() => {
+    // Only process if we're in the token approval phase
+    if (isTokenApproveSuccess && pendingAction && approvalPhase === "token") {
+      console.log(`Token approval successful, executing pending action: ${pendingAction}`);
+      
+      // Refetch allowance and wait for it to complete before executing action
+      const executeAfterRefetch = async () => {
+        try {
+          // Multiple refetch attempts with increasing delays to ensure allowance is updated
+          let attempts = 0;
+          const maxAttempts = 5;
+          const checkAndExecute = async (): Promise<void> => {
+            attempts++;
+            console.log(`Refetch attempt ${attempts}/${maxAttempts}`);
+            
+            const { data: newAllowance } = await refetchTokenAllowance();
+            console.log(`Token allowance after refetch: ${newAllowance}`);
+            
+            // Check if the allowance is now sufficient
+            const currentBet = playerHand0Bet ? BigInt(playerHand0Bet) : BigInt(0);
+            // Insurance is always half the bet (maximum allowed by contract)
+            const insuranceAmountBigInt = currentBet / BigInt(2);
+            
+            // For insurance, check against the insurance amount; for others, check against current bet
+            const requiredAmount = pendingAction === "placeInsurance" ? insuranceAmountBigInt : currentBet;
+            const isNowApproved = newAllowance && newAllowance >= requiredAmount;
+            
+            if (isNowApproved) {
+              console.log(`Token allowance confirmed, now executing: ${pendingAction}`);
+              
+              // Check if game state is still valid for the action
+              const currentState = gameState ? Number(gameState) : 0;
+              const isPlayerTurnAction = ["doubleDown", "split", "hit", "stand"].includes(pendingAction);
+              const isInsuranceAction = pendingAction === "placeInsurance";
+              
+              if (isPlayerTurnAction && currentState !== GameState.PlayerTurn) {
+                console.error(`Cannot execute ${pendingAction}: game state changed from PlayerTurn to ${GameState[currentState]}`);
+                setTxError(`Cannot ${pendingAction}: game state changed. Please try again if still in player's turn.`);
+                setPendingAction(null);
+                setApprovalPhase("none");
+                return;
+              }
+              
+              if (isInsuranceAction && currentState !== GameState.InsuranceOffer) {
+                console.error(`Cannot execute insurance: game state changed from InsuranceOffer to ${GameState[currentState]}`);
+                setTxError(`Cannot place insurance: game state changed.`);
+                setPendingAction(null);
+                setApprovalPhase("none");
+                return;
+              }
+              
+              // Execute with args if it's placeInsurance
+              if (pendingAction === "placeInsurance") {
+                execute(pendingAction, [insuranceAmountBigInt]);
+              } else {
+                execute(pendingAction);
+              }
+              setPendingAction(null);
+              setApprovalPhase("none");
+            } else if (attempts < maxAttempts) {
+              // Try again after a delay
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              return checkAndExecute();
+            } else {
+              console.error('Token allowance not updated after max attempts');
+              setTxError('Token approval succeeded but allowance not updated. Please try again.');
+              setPendingAction(null);
+              setApprovalPhase("none");
+            }
+          };
+          
+          // Start checking after initial delay
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          await checkAndExecute();
+        } catch (err) {
+          console.error('Error refetching token allowance:', err);
+          setTxError('Failed to verify token approval. Please try again.');
+          setPendingAction(null);
+          setApprovalPhase("none");
+        }
+      };
+      
+      executeAfterRefetch();
+    }
+  }, [isTokenApproveSuccess, pendingAction, approvalPhase, execute, refetchTokenAllowance, playerHand0Bet, setTxError]);
+
+  // Refetch LINK allowance after successful approval and execute pending action
+  useEffect(() => {
+    // Only process if we're in the LINK approval phase
+    if (isApproveSuccess && pendingAction && approvalPhase === "link") {
+      console.log(`LINK approval successful, executing pending action: ${pendingAction}`);
+      
+      // Refetch allowance and wait for it to complete before executing action
+      const executeAfterRefetch = async () => {
+        try {
+          // Multiple refetch attempts with increasing delays to ensure allowance is updated
+          let attempts = 0;
+          const maxAttempts = 5;
+          const checkAndExecute = async (): Promise<void> => {
+            attempts++;
+            console.log(`LINK refetch attempt ${attempts}/${maxAttempts}`);
+            
+            const { data: newAllowance } = await refetchLinkAllowance();
+            console.log(`LINK allowance after refetch: ${newAllowance}`);
+            
+            // Check if the allowance is now sufficient
+            const isNowApproved = newAllowance && linkFeePerAction && newAllowance >= linkFeePerAction;
+            
+            if (isNowApproved) {
+              console.log(`LINK allowance confirmed for: ${pendingAction}`);
+              
+              // Before executing, check if token approval is also needed for this action
+              const currentBet = playerHand0Bet ? BigInt(playerHand0Bet) : BigInt(0);
+              // Insurance is always half the bet (maximum allowed by contract)
+              const insuranceAmountBigInt = currentBet / BigInt(2);
+              
+              const needsTokenApproval = 
+                (pendingAction === "doubleDown" || pendingAction === "split") && !isTokenApprovedFor(currentBet) ||
+                (pendingAction === "placeInsurance" && !isTokenApprovedFor(insuranceAmountBigInt));
+              
+              if (needsTokenApproval) {
+                console.log(`${pendingAction} also needs token approval, requesting now...`);
+                const amount = pendingAction === "placeInsurance" ? insuranceAmountBigInt : currentBet;
+                // Move to token approval phase - this will prevent this useEffect from running again
+                handleApproveToken(pendingAction, amount);
+                // Don't clear pendingAction - let token approval flow handle execution
+                return;
+              }
+              
+              // Check if game state is still valid for the action
+              const currentState = gameState ? Number(gameState) : 0;
+              const isPlayerTurnAction = ["doubleDown", "split", "hit", "stand"].includes(pendingAction);
+              const isInsuranceAction = pendingAction === "placeInsurance";
+              const isSurrender = pendingAction === "surrender";
+              
+              if (isPlayerTurnAction && currentState !== GameState.PlayerTurn) {
+                console.error(`Cannot execute ${pendingAction}: game state changed from PlayerTurn to ${GameState[currentState]}`);
+                setTxError(`Cannot ${pendingAction}: game state changed. Please try again if still in player's turn.`);
+                setPendingAction(null);
+                setApprovalPhase("none");
+                return;
+              }
+              
+              if (isInsuranceAction && currentState !== GameState.InsuranceOffer) {
+                console.error(`Cannot execute insurance: game state changed from InsuranceOffer to ${GameState[currentState]}`);
+                setTxError(`Cannot place insurance: game state changed.`);
+                setPendingAction(null);
+                setApprovalPhase("none");
+                return;
+              }
+              
+              if (isSurrender && currentState !== GameState.PlayerTurn && currentState !== GameState.InsuranceOffer) {
+                console.error(`Cannot execute surrender: game state changed to ${GameState[currentState]}`);
+                setTxError(`Cannot surrender: game state changed.`);
+                setPendingAction(null);
+                setApprovalPhase("none");
+                return;
+              }
+              
+              console.log(`All approvals confirmed, now executing: ${pendingAction}`);
+              execute(pendingAction);
+              setPendingAction(null);
+              setApprovalPhase("none");
+            } else if (attempts < maxAttempts) {
+              // Try again after a delay
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              return checkAndExecute();
+            } else {
+              console.error('LINK allowance not updated after max attempts');
+              setTxError('LINK approval succeeded but allowance not updated. Please try again.');
+              setPendingAction(null);
+              setApprovalPhase("none");
+            }
+          };
+          
+          // Start checking after initial delay
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          await checkAndExecute();
+        } catch (err) {
+          console.error('Error refetching LINK allowance:', err);
+          setTxError('Failed to verify LINK approval. Please try again.');
+          setPendingAction(null);
+          setApprovalPhase("none");
+        }
+      };
+      
+      executeAfterRefetch();
+    }
+  }, [isApproveSuccess, pendingAction, approvalPhase, execute, refetchLinkAllowance, linkFeePerAction, setTxError]);
+
+  const handleHit = () => {
+    // Prevent action if game is finished
+    if (gameState === GameState.Finished || gameResult) {
+      console.log("Game is finished, cannot perform action");
+      return;
+    }
+    execute("hit");
+  };
+
+  const handleStand = () => {
+    // Prevent action if game is finished
+    if (gameState === GameState.Finished || gameResult) {
+      console.log("Game is finished, cannot perform action");
+      return;
+    }
+    
+    // Check if we have enough LINK approved (stand() needs LINK for dealer's hole card)
+    if (!isLINKApproved) {
+      console.log("Need to approve LINK before stand");
+      handleApproveLINK("stand");
+      return;
+    }
+    
+    execute("stand");
+  };
+
+  const handleDoubleDown = () => {
+    // Prevent action if game is finished
+    if (gameState === GameState.Finished || gameResult) {
+      console.log("Game is finished, cannot perform action");
+      return;
+    }
+    
+    // Don't allow action if ANY approval is pending or already executing
+    if (isApprovingToken || isApprovingLINK || isPending) {
+      console.log("Approval or action still pending, please wait...");
+      return;
+    }
+    
+    // Don't allow if there's already a pending action
+    if (pendingAction) {
+      console.log("Another action is already pending, please wait...");
+      return;
+    }
+    
+    // Don't allow if there's already a current action being executed
+    if (currentAction) {
+      console.log("Another action is currently executing, please wait...");
+      return;
+    }
+    
+    // Double down requires additional bet equal to original bet
+    const currentBet = playerHand0Bet ? BigInt(playerHand0Bet) : BigInt(0);
+    
+    // Priority 1: Check LINK approval FIRST (most important)
+    if (!isLINKApproved) {
+      console.log("Need to approve LINK first for double down");
+      handleApproveLINK("doubleDown");
+      return;
+    }
+    
+    // Priority 2: Check token approval AFTER LINK is approved
+    if (!isTokenApprovedFor(currentBet)) {
+      console.log(`Need to approve ${currentBet} tokens for double down`);
+      handleApproveToken("doubleDown", currentBet);
+      return;
+    }
+    
+    // Priority 3: Execute action only when both approvals are done
+    console.log(`All approvals confirmed, executing double down`);
+    execute("doubleDown");
+  };
+
+  const handleSplit = () => {
+    // Prevent action if game is finished
+    if (gameState === GameState.Finished || gameResult) {
+      console.log("Game is finished, cannot perform action");
+      return;
+    }
+    
+    // Don't allow action if ANY approval is pending or already executing
+    if (isApprovingToken || isApprovingLINK || isPending) {
+      console.log("Approval or action still pending, please wait...");
+      return;
+    }
+    
+    // Don't allow if there's already a pending action
+    if (pendingAction) {
+      console.log("Another action is already pending, please wait...");
+      return;
+    }
+    
+    // Don't allow if there's already a current action being executed
+    if (currentAction) {
+      console.log("Another action is currently executing, please wait...");
+      return;
+    }
+    
+    // Split requires additional bet equal to original bet
+    const currentBet = playerHand0Bet ? BigInt(playerHand0Bet) : BigInt(0);
+    
+    // Priority 1: Check LINK approval FIRST
+    if (!isLINKApproved) {
+      console.log("Need to approve LINK first for split");
+      handleApproveLINK("split");
+      return;
+    }
+    
+    // Priority 2: Check token approval AFTER LINK is approved
+    if (!isTokenApprovedFor(currentBet)) {
+      console.log(`Need to approve ${currentBet} tokens for split`);
+      handleApproveToken("split", currentBet);
+      return;
+    }
+    
+    // Priority 3: Execute action only when both approvals are done
+    console.log(`All approvals confirmed, executing split`);
+    execute("split");
+  };
+
+  const handlePlaceInsurance = () => {
+    // Prevent action if game is finished
+    if (gameState === GameState.Finished || gameResult) {
+      console.log("Game is finished, cannot perform action");
+      return;
+    }
+    
+    // Check if we're still in insurance phase
+    if (gameState !== GameState.InsuranceOffer) {
+      console.log("No longer in insurance phase, cannot place insurance");
+      setTxError("Insurance phase has ended. The game has moved to the next phase.");
+      return;
+    }
+    
+    // Don't allow action if ANY approval is pending or already executing
+    if (isApprovingToken || isApprovingLINK || isPending) {
+      console.log("Approval or action still pending, please wait...");
+      return;
+    }
+    
+    // Don't allow if there's already a pending action
+    if (pendingAction) {
+      console.log("Another action is already pending, please wait...");
+      return;
+    }
+    
+    // Calculate insurance amount as half the bet (contract maximum)
+    const currentBet = playerHand0Bet ? BigInt(playerHand0Bet) : BigInt(0);
+    const amount = currentBet / BigInt(2);
+    
+    if (amount === BigInt(0)) {
+      setTxError("Cannot place insurance - invalid bet amount");
+      return;
+    }
+    
+    // Priority 1: Check LINK approval FIRST
+    if (!isLINKApproved) {
+      console.log("Need to approve LINK first for insurance");
+      handleApproveLINK("placeInsurance");
+      return;
+    }
+    
+    // Priority 2: Check token approval AFTER LINK is approved
+    // Insurance requires tokens equal to the insurance amount
+    if (!isTokenApprovedFor(amount)) {
+      console.log(`Need to approve ${amount} tokens for insurance`);
+      handleApproveToken("placeInsurance", amount);
+      return;
+    }
+    
+    // Priority 3: Execute action only when both approvals are done
+    console.log(`All approvals confirmed, placing insurance for ${amount} tokens`);
+    setPlacedInsuranceAmount(amount); // Track the insurance bet
+    execute("placeInsurance", [amount]);
+  };
+
+  const handleSkipInsurance = () => {
+    // Prevent action if game is finished
+    if (gameState === GameState.Finished || gameResult) {
+      console.log("Game is finished, cannot perform action");
+      return;
+    }
+    execute("skipInsurance");
+  };
+
+  const handleSurrender = () => {
+    // Prevent action if game is finished
+    if (gameState === GameState.Finished || gameResult) {
+      console.log("Game is finished, cannot perform action");
+      return;
+    }
+    
+    // Get current player hand data from contract
+    const firstHandCards = playerHand0Cards?.length || 0;
+    
+    // Log current state for debugging
+    console.log(`[SURRENDER] Attempting surrender. Current state: ${gameState}, isPlayerTurn: ${isPlayerTurn}, isInsuranceOffer: ${isInsuranceOffer}`);
+    console.log(`[SURRENDER] First hand cards: ${firstHandCards}`);
+    
+    // Double-check state before executing
+    if (gameState !== GameState.PlayerTurn && gameState !== GameState.InsuranceOffer) {
+      setTxError(`Cannot surrender - game state is ${gameState}, not PlayerTurn or InsuranceOffer`);
+      console.error(`[SURRENDER] State check failed: ${gameState}`);
+      return;
+    }
+    
+    if (firstHandCards !== 2) {
+      setTxError(`Cannot surrender - you have ${firstHandCards} cards (need exactly 2)`);
+      console.error(`[SURRENDER] Cards check failed: ${firstHandCards}`);
+      return;
+    }
+    
+    execute("surrender");
+  };
+
+  // Clear pending actions when game finishes
+  useEffect(() => {
+    if (state === GameState.Finished) {
+      console.log("Game finished, clearing any pending actions and approval phase");
+      setPendingAction(null);
+      setCurrentAction(null);
+      setApprovalPhase("none");
+    }
+  }, [state]);
+
+  // Clear recentlySplitHand flag when number of hands increases (split successful and refetched)
+  const prevNumHandsRef = useRef<number>(1);
+  useEffect(() => {
+    if (numHands > prevNumHandsRef.current && recentlySplitHand !== null) {
+      console.log(`Hand count increased from ${prevNumHandsRef.current} to ${numHands}, clearing recentlySplitHand flag`);
+      setRecentlySplitHand(null);
+    }
+    prevNumHandsRef.current = numHands;
+  }, [numHands, recentlySplitHand]);
+
+  // Initialize dealer hole card revealed state on first load based on game state
+  const initializedRef = useRef(false);
+  useEffect(() => {
+    // Only run once on component mount when we have state data
+    if (!initializedRef.current && state !== undefined) {
+      const isDealerTurn = state === GameState.DealerTurn;
+      const isFinished = state === GameState.Finished;
+      
+      // If the game is already in DealerTurn or Finished state when we load the page,
+      // the hole card should already be revealed (no flip animation on page load)
+      if (isDealerTurn || isFinished) {
+        console.log("🎴 Page loaded with dealer turn/finished - initializing hole card as revealed (no animation)");
+        setDealerHoleCardRevealed(true);
+      }
+      
+      initializedRef.current = true;
+    }
+  }, [state]);
+
+  // Track when dealer's hole card should be revealed (and keep it revealed once revealed)
+  useEffect(() => {
+    const isDealerTurn = state === GameState.DealerTurn;
+    const isFinished = state === GameState.Finished;
+    const isNotStarted = state === GameState.NotStarted;
+    
+    // Reset flag ONLY when game hasn't started yet (not during dealing after initial)
+    if (isNotStarted && dealerHoleCardRevealed) {
+      console.log("Resetting dealer's hole card to hidden for new game");
+      setDealerHoleCardRevealed(false);
+      initializedRef.current = false; // Reset for next game
+    }
+    
+    // Clear cached dealer cards and insurance amount when starting a new game
+    if (isNotStarted && lastKnownDealerCards.length > 0) {
+      console.log("Clearing cached dealer cards for new game");
+      setLastKnownDealerCards([]);
+    }
+    
+    if (isNotStarted && placedInsuranceAmount > BigInt(0)) {
+      console.log("Resetting insurance amount for new game");
+      setPlacedInsuranceAmount(BigInt(0));
+    }
+    
+    // Clear recently split flag for new game
+    if (isNotStarted && recentlySplitHand !== null) {
+      console.log("Clearing recentlySplitHand flag for new game");
+      setRecentlySplitHand(null);
+    }
+    
+    // Reveal card when dealer's turn or game finished, and keep it revealed
+    if ((isDealerTurn || isFinished) && !dealerHoleCardRevealed) {
+      console.log("🎴🎴🎴 Revealing dealer's hole card permanently - this should trigger flip animation!");
+      setDealerHoleCardRevealed(true);
+    }
+  }, [state, dealerHoleCardRevealed, lastKnownDealerCards.length, recentlySplitHand]);
+
+  // Auto-trigger continueDealer when game enters DealerTurn state
+  // After the VRF gas limit fix, continueDealer() must be called in a separate transaction
+  // to execute the dealer logic with sufficient gas, avoiding "gas limit set too low" errors.
+  useEffect(() => {
+    const isDealerTurn = state === GameState.DealerTurn;
+    const isWaitingForVRF = isPending || currentAction;
+    const isGameFinished = state === GameState.Finished;
+    
+    // IMPORTANT: Don't trigger if game is finished (prevents extra transaction after game ends)
+    if (isGameFinished) {
+      if (dealerHitTriggeredRef.current) {
+        console.log("🏁 Game finished - resetting dealerHitTriggered flag");
+      }
+      dealerHitTriggeredRef.current = false;
+      return;
+    }
+    
+    // Trigger continueDealer if:
+    // 1. Game is in DealerTurn state
+    // 2. We're not currently waiting for a transaction
+    // 3. We haven't already triggered for this specific state transition
+    //
+    // Reset trigger when we leave DealerTurn (go to Dealing for VRF or Finished)
+    if (isDealerTurn && !isWaitingForVRF && !dealerHitTriggeredRef.current) {
+      console.log("🎲 Auto-triggering continueDealer() for dealer turn");
+      dealerHitTriggeredRef.current = true;
+      execute("continueDealer");
+    }
+    
+    // Reset the trigger flag when we leave DealerTurn state
+    // This allows continueDealer to be called again when we return to DealerTurn after VRF
+    if (!isDealerTurn) {
+      if (dealerHitTriggeredRef.current) {
+        console.log("↩️ Resetting dealerHitTriggered flag (left DealerTurn state)");
+      }
+      dealerHitTriggeredRef.current = false;
+    }
+  }, [state, isPending, currentAction, execute]);
+
+  // ALWAYS use contract's finalPayout as source of truth
+  // Contract emits: GameFinished(totalPayout > 0 ? "won" : "lost", totalPayout)
+  useEffect(() => {
+    if (state === GameState.Finished && contractFinalPayout !== undefined) {
+      const payout = BigInt(contractFinalPayout);
+      const result = payout > BigInt(0) ? "won" : "lost";
+      
+      console.log("💎 Reading result from contract finalPayout:", {
+        result,
+        payout: payout.toString(),
+      });
+      
+      // Only update if different to avoid unnecessary re-renders
+      if (!gameResult || gameResult.payout !== payout || gameResult.result !== result) {
+        setGameResult({
+          result,
+          payout,
+        });
+      }
+    }
+  }, [state, contractFinalPayout, gameResult]);
+
+  // Trigger fireworks when player wins (must be before early return to maintain hook order)
+  useEffect(() => {
+    if (gameResult && state === GameState.Finished) {
+      // Use the pre-calculated result to determine if fireworks should show
+      // Show fireworks for wins and blackjacks, but NOT for insurance payouts (those are defensive wins)
+      const shouldShowFireworks = gameResult.result === "won" || gameResult.result === "blackjack";
+      
+      if (shouldShowFireworks) {
+        setShowFireworks(true);
+        // Hide fireworks after 5 seconds
+        const timer = setTimeout(() => setShowFireworks(false), 5000);
+        return () => clearTimeout(timer);
+      } else {
+        // Make sure fireworks are hidden if not a win
+        setShowFireworks(false);
+      }
+    }
+  }, [gameResult, state]);
+
+  if (!gameState) {
+    return <div className="card">Loading game...</div>;
+  }
+
+  // Build playerHands array from all fetched hand data
+  const playerHands = [];
+  
+  // Hand 0
+  if (playerHand0Cards && playerHand0Bet !== undefined) {
+    const cards = Array.isArray(playerHand0Cards) ? playerHand0Cards : [];
+    const bet = typeof playerHand0Bet === 'bigint' || typeof playerHand0Bet === 'number' ? playerHand0Bet : BigInt(0);
+    
+    playerHands.push({ 
+      cards: cards.map(c => BigInt(c)), 
+      bet: BigInt(bet),
+      stood: false,
+      busted: false,
+      doubled: false
+    });
+  }
+  
+  // Hand 1 (if exists)
+  if (numHands >= 2 && playerHand1Cards && playerHand1Bet !== undefined) {
+    const cards = Array.isArray(playerHand1Cards) ? playerHand1Cards : [];
+    const bet = typeof playerHand1Bet === 'bigint' || typeof playerHand1Bet === 'number' ? playerHand1Bet : BigInt(0);
+    
+    playerHands.push({ 
+      cards: cards.map(c => BigInt(c)), 
+      bet: BigInt(bet),
+      stood: false,
+      busted: false,
+      doubled: false
+    });
+  }
+  
+  // Hand 2 (if exists)
+  if (numHands >= 3 && playerHand2Cards && playerHand2Bet !== undefined) {
+    const cards = Array.isArray(playerHand2Cards) ? playerHand2Cards : [];
+    const bet = typeof playerHand2Bet === 'bigint' || typeof playerHand2Bet === 'number' ? playerHand2Bet : BigInt(0);
+    
+    playerHands.push({ 
+      cards: cards.map(c => BigInt(c)), 
+      bet: BigInt(bet),
+      stood: false,
+      busted: false,
+      doubled: false
+    });
+  }
+  
+  // Hand 3 (if exists)
+  if (numHands >= 4 && playerHand3Cards && playerHand3Bet !== undefined) {
+    const cards = Array.isArray(playerHand3Cards) ? playerHand3Cards : [];
+    const bet = typeof playerHand3Bet === 'bigint' || typeof playerHand3Bet === 'number' ? playerHand3Bet : BigInt(0);
+    
+    playerHands.push({ 
+      cards: cards.map(c => BigInt(c)), 
+      bet: BigInt(bet),
+      stood: false,
+      busted: false,
+      doubled: false
+    });
+  }
+
+  // Calculate scores
+  const calculateScore = (cards: readonly bigint[]) => {
+    let score = 0;
+    let aces = 0;
+    for (const card of cards) {
+      // Match Solidity: ((cardId - 1) % 13) + 1 gives rank 1-13
+      const rank = ((Number(card) - 1) % 13) + 1;
+      if (rank === 1) {
+        // Ace
+        aces++;
+        score += 11;
+      } else if (rank >= 11) {
+        // Face cards (J=11, Q=12, K=13)
+        score += 10;
+      } else {
+        // Number cards 2-10
+        score += rank;
+      }
+    }
+    while (score > 21 && aces > 0) {
+      score -= 10;
+      aces--;
+    }
+    return score;
+  };
+
+  // Determine if we can perform special actions
+  const isPlayerTurn = state === GameState.PlayerTurn;
+  const isInsuranceOffer = state === GameState.InsuranceOffer;
+  const isFinished = state === GameState.Finished;
+  const isDealerTurn = state === GameState.DealerTurn;
+
+  const currentPlayerHand = playerHands[currentHand];
+  // Check game conditions (LINK approval handled separately in button logic)
+  const canHit = isPlayerTurn && currentPlayerHand && !currentPlayerHand.doubled && !currentPlayerHand.stood;
+  const canStand = isPlayerTurn && currentPlayerHand && !currentPlayerHand.stood;
+  const canDoubleDown = isPlayerTurn && currentPlayerHand && currentPlayerHand.cards.length === 2 && !currentPlayerHand.doubled;
+  
+  // Allow splitting on any hand, up to 4 hands total (contract limit)
+  // Also prevent splitting if we just completed a split action (waiting for state to refetch)
+  // IMPORTANT: Also check if a split from this hand already created a new hand
+  // For example, if we're on hand 0 and hand 1 exists, hand 0 was already split
+  // If we're on hand 1 and hand 2 exists, hand 1 was already split
+  const alreadySplitThisHand = currentHand < playerHands.length - 1; // If there's a hand after current, this was already split
+  const canSplit = isPlayerTurn && 
+                   playerHands.length < 4 &&  // Contract allows max 4 hands
+                   recentlySplitHand === null &&  // Don't allow split if we just split (waiting for refetch)
+                   !alreadySplitThisHand &&  // Don't allow split if this hand already created a new hand
+                   currentPlayerHand && 
+                   currentPlayerHand.cards.length === 2 && 
+                   !currentPlayerHand.stood &&  // Can't split a hand that's already stood
+                   (((Number(currentPlayerHand.cards[0]) - 1) % 13) + 1) === (((Number(currentPlayerHand.cards[1]) - 1) % 13) + 1);
+  
+  // Debug log for split eligibility
+  if (currentPlayerHand && currentPlayerHand.cards.length === 2) {
+    console.log(`🎯 Split check: playerTurn=${isPlayerTurn}, hands=${playerHands.length}/4, currentHand=${currentHand}, recentlySplit=${recentlySplitHand}, alreadySplitThisHand=${alreadySplitThisHand}, cardCount=${currentPlayerHand.cards.length}, stood=${currentPlayerHand.stood}, canSplit=${canSplit}`);
+  }
+  
+  const canSurrender = (isPlayerTurn || isInsuranceOffer) && playerHands.length === 1 && playerHands[0] && playerHands[0].cards.length === 2;
+
+  console.log("🎮 GamePlay rendering - gameAddress:", gameAddress, "state:", state, "GameState.Dealing:", GameState.Dealing);
+
+  return (
+    <div className="relative max-w-6xl mx-auto">
+      {showFireworks && <Fireworks duration={5000} />}
+      
+      <div className="card bg-gradient-to-br from-green-800 to-green-900 text-white">
+        <div className="flex justify-between items-center mb-6">
+        <div>
+          <h2 className="text-3xl font-bold text-yellow-300">♠️ Blackjack ♥️</h2>
+          <p className="text-xs font-mono text-gray-300 mt-1 break-all">
+            Game: {gameAddress}
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="text-sm bg-black/30 px-4 py-2 rounded-lg">
+            <span className="font-semibold">State:</span> {GameState[state]}
+          </div>
+          {/* LINK Status Indicator */}
+          {linkAllowance !== undefined && linkFeePerAction && (
+            <div className={`text-xs px-3 py-2 rounded-lg ${
+              isLINKApproved 
+                ? "bg-green-600/30 border border-green-400" 
+                : "bg-red-600/30 border border-red-400"
+            }`}>
+              <div className="font-semibold">
+                {isLINKApproved ? "✓ LINK OK" : "⚠ Need LINK"}
+              </div>
+              <div className="text-[10px] text-gray-300">
+                {Math.floor(Number(linkAllowance) / Number(linkFeePerAction))} actions left
+              </div>
+            </div>
+          )}
+          {onMinimize && (
+            <button
+              onClick={() => {
+                console.log("GamePlay: Minimize button clicked!");
+                onMinimize();
+              }}
+              className="bg-yellow-500/80 hover:bg-yellow-600 text-white px-4 py-2 rounded-lg transition-colors"
+              title="Minimize to sidebar"
+            >
+              ⬇️ Minimize
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Card Dealing Area - with inner shadow from top-right */}
+      <div className="card-area-shadow rounded-xl p-6 mb-6 border border-white/20 relative">
+        {/* Win/Loss overlay tint */}
+        {state === GameState.Finished && gameResult && (
+          <div className="absolute inset-0 rounded-xl pointer-events-none z-10 animate-fade-in-overlay bg-black/25" />
+        )}
+        
+        {/* Dealer Hand */}
+        <div className="mb-4 pt-3 px-4 pb-5 bg-black/20 rounded-xl card-box-highlight">
+          <h3 className="text-xl font-semibold mb-2 text-yellow-300 pl-2">
+            Dealer {(isFinished || isDealerTurn || dealerCards.length > 2) && dealerCards.length > 0 ? `(${calculateScore(dealerCards)})` : ""}
+          </h3>
+        <div className="flex flex-wrap gap-2">
+          {dealerCards.length > 0 ? (
+            <>
+              {/* First card (up card) - always face-up */}
+              {(() => {
+                // First card is ALWAYS face-up (dealer's up card)
+                // EXCEPTION: During initial deal (before VRF completes), show back then flip
+                
+                const isDealDuringGameplay = initialDealerCardCount.current === 0;
+                
+                // Determine if this card was already present on page load (should show immediately)
+                // vs. being dealt during gameplay (should animate)
+                const wasAlreadyPresent = initialDealerCardCount.current !== null && initialDealerCardCount.current >= 1;
+                
+                // If card was already there on load, just show it face-up (no animation)
+                if (wasAlreadyPresent) {
+                  console.log(`🎴 FIRST CARD (already present): cardValue=${Number(dealerCards[0])}, showing face-up directly`);
+                  return (
+                    <PlayingCard 
+                      key="dealer-first-card"
+                      cardValue={Number(dealerCards[0])}
+                      isHidden={false}
+                      shouldFlip={false}
+                      shouldFadeIn={false}
+                    />
+                  );
+                }
+                
+                // Card is being dealt during gameplay - should start face-down then flip
+                const shouldFlip = dealerFirstCardShouldFlip;
+                console.log(`🎴 FIRST CARD (dealt during gameplay): cardValue=${Number(dealerCards[0])}, dealerFirstCardShouldFlip=${dealerFirstCardShouldFlip}, shouldFlip=${shouldFlip}`);
+                
+                return (
+                  <PlayingCard 
+                    key="dealer-first-card"
+                    cardValue={Number(dealerCards[0])}
+                    isHidden={true}
+                    shouldFlip={shouldFlip}
+                    shouldFadeIn={false}
+                  />
+                );
+              })()}
+              
+              {/* Second card logic: */}
+              {/* ALWAYS render the hole card slot to avoid mounting/unmounting which causes blink */}
+              {(() => {
+                const hasHoleCard = dealerCards.length > 1;
+                
+                if (!hasHoleCard) {
+                  // No hole card yet - show placeholder during player turn
+                  if (state !== GameState.NotStarted && state !== GameState.Finished) {
+                    return <PlayingCard key="dealer-hole-card" cardValue={0} isHidden />;
+                  }
+                  return null;
+                }
+                
+                // Dealer has hole card
+                // DON'T fade in because we're replacing a placeholder (that was already visible)
+                // Fade in would cause a blink (opacity goes 0->1)
+                return (
+                  <PlayingCard 
+                    key="dealer-hole-card"
+                    cardValue={Number(dealerCards[1])} 
+                    isHidden={!dealerHoleCardRevealed}
+                    shouldFlip={dealerHoleCardRevealed}
+                    shouldFadeIn={false}
+                  />
+                );
+              })()}
+              
+              {/* Show all additional cards face up with fade-in animation */}
+              {dealerCards.slice(2).map((card, index) => {
+                const cardPosition = index + 2;
+                const initialCount = initialDealerCardCount.current || 0;
+                // Fade in if this card was added after initial load
+                const shouldFade = cardPosition >= initialCount && seenDealerCardCount >= (cardPosition - initialCount + 1);
+                return (
+                  <PlayingCard 
+                    key={`dealer-${cardPosition}`}
+                    cardValue={Number(card)}
+                    shouldFadeIn={shouldFade}
+                  />
+                );
+              })}
+            </>
+          ) : (
+            <>
+              <PlayingCard cardValue={0} isHidden />
+              {state !== GameState.NotStarted && (
+                <PlayingCard cardValue={0} isHidden />
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Player Hands */}
+      <div>
+        {playerHands.map((hand, index) => (
+          <div
+            key={index}
+            className={`pt-3 px-4 pb-5 rounded-xl mb-4 card-box-highlight ${
+              index === currentHand && isPlayerTurn
+                ? "bg-green-500/15 ring-4 ring-green-400/60 border border-white/40"
+                : "bg-black/20"
+            }`}
+          >
+            <div className="flex justify-between items-center mb-1 pl-2">
+              <h3 className="text-xl font-semibold text-yellow-200">
+                {playerHands.length > 1 ? `Hand ${index + 1}` : "Your Hand"}
+                {hand.cards.length > 0 && ` (${calculateScore(hand.cards)})`}
+                {index === currentHand && isPlayerTurn && (
+                  <span className="ml-3 text-sm bg-yellow-400 text-black px-3 py-1 rounded-full">
+                    Active
+                  </span>
+                )}
+              </h3>
+              <div className="text-lg bg-black/40 px-4 py-2 rounded-lg">
+                <span className="font-semibold">Bet:</span> {Math.floor(Number(hand.bet) / 1e18)} BJT
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {hand.cards.map((card, cardIndex) => {
+                const initialCount = initialPlayerCardCounts.current ? initialPlayerCardCounts.current[index] : 0;
+                // Fade in only when this specific card position was added after initial load
+                // Use >= so prop stays true even when more cards are added
+                const cardPositionInNewCards = cardIndex - initialCount + 1; // 1-indexed position among new cards
+                const shouldFade = cardIndex >= initialCount && seenPlayerCardCounts[index] >= cardPositionInNewCards;
+                return (
+                  <PlayingCard 
+                    key={`hand-${index}-card-${cardIndex}`}
+                    cardValue={Number(card)}
+                    shouldFadeIn={shouldFade}
+                  />
+                );
+              })}
+            </div>
+
+            {hand.busted && (
+              <div className="mt-3 text-red-400 font-bold text-xl">BUSTED!</div>
+            )}
+            {hand.doubled && (
+              <div className="mt-3 text-blue-400 font-semibold">Doubled Down</div>
+            )}
+            {hand.stood && !hand.busted && (
+              <div className="mt-3 text-gray-400 font-semibold">Standing</div>
+            )}
+          </div>
+        ))}
+      </div>
+      {/* End Card Dealing Area */}
+
+      {/* Insurance Offer */}
+      {isInsuranceOffer && (
+        <div className="mb-6 p-6 bg-blue-600/30 rounded-xl border-2 border-blue-400">
+          <h3 className="text-xl font-bold mb-3">Insurance Offer</h3>
+          <p className="mb-3">
+            The dealer is showing an Ace and might have Blackjack. Would you like to purchase insurance?
+          </p>
+          <div className="mb-4 p-4 bg-blue-900/50 rounded-lg border border-blue-300">
+            <p className="text-lg font-semibold mb-2">💰 Insurance Details:</p>
+            <ul className="space-y-1 text-sm">
+              <li>• Cost: <span className="font-bold text-green-300">{playerHand0Bet ? formatUnits(BigInt(playerHand0Bet) / BigInt(2), 18) : "0"} BJT</span> (half of your bet)</li>
+              <li>• Pays 2:1 if the dealer has Blackjack</li>
+              <li>• If dealer has Blackjack, you'll win back your full bet amount</li>
+              <li>• If dealer doesn't have Blackjack, you lose the insurance bet and play continues</li>
+            </ul>
+          </div>
+          <div className="flex gap-4 items-center">
+            <button
+              onClick={handlePlaceInsurance}
+              disabled={isPending || isApprovingLINK || isApprovingToken}
+              className="btn btn-primary flex-1"
+            >
+              {(isApprovingLINK || isApprovingToken) && pendingAction === "placeInsurance" ? "Approving..." : 
+               isPending && currentAction === "placeInsurance" ? "Placing Insurance..." : 
+               !isLINKApproved ? "🔓 Buy Insurance (Approve LINK)" : 
+               (playerHand0Bet && !isTokenApprovedFor(BigInt(playerHand0Bet) / BigInt(2))) ? "🔓 Buy Insurance (Approve Tokens)" : 
+               `Buy Insurance (${playerHand0Bet ? formatUnits(BigInt(playerHand0Bet) / BigInt(2), 18) : "0"} BJT)`}
+            </button>
+            <button
+              onClick={handleSkipInsurance}
+              disabled={isPending || isApprovingLINK}
+              className="btn btn-secondary flex-1"
+            >
+              {isPending && currentAction === "skipInsurance" ? "Skipping..." : "No Insurance"}
+            </button>
+          </div>
+          {!isLINKApproved && (
+            <p className="text-sm text-yellow-300 mt-3">
+              ℹ️ Click "Buy Insurance" to approve LINK first (one-time approval for all game actions)
+            </p>
+          )}
+          {isLINKApproved && playerHand0Bet && !isTokenApprovedFor(BigInt(playerHand0Bet) / BigInt(2)) && (
+            <p className="text-sm text-yellow-300 mt-3">
+              ℹ️ Click "Buy Insurance" again to approve {formatUnits(BigInt(playerHand0Bet) / BigInt(2), 18)} BJT tokens for this insurance bet
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Action Buttons */}
+      {isPlayerTurn && gameState !== GameState.Finished && !gameResult && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <button
+              onClick={() => !isLINKApproved ? handleApproveLINK("hit") : handleHit()}
+              disabled={!canHit || isPending || isApprovingLINK}
+              className={`btn ${canHit ? "btn-primary" : "btn-disabled"}`}
+              title={canHit ? "Draw another card" : "Not available"}
+            >
+              {isApprovingLINK && pendingAction === "hit" ? "Approving..." : isPending ? "Processing..." : "🃏 Hit"}
+            </button>
+            <button
+              onClick={() => !isLINKApproved ? handleApproveLINK("stand") : handleStand()}
+              disabled={!canStand || isPending || isApprovingLINK}
+              className={`btn ${canStand ? "btn-danger" : "btn-disabled"}`}
+              title={canStand ? "Keep current hand" : "Not available"}
+            >
+              {isApprovingLINK && pendingAction === "stand" ? "Approving..." : isPending && currentAction === "stand" ? "Standing..." : "✋ Stand"}
+            </button>
+            <button
+              onClick={handleDoubleDown}
+              disabled={!canDoubleDown || isPending || isApprovingLINK || isApprovingToken || !!pendingAction}
+              className={`btn ${canDoubleDown && !isPending && !isApprovingLINK && !isApprovingToken && !pendingAction ? (!isLINKApproved ? "btn-warning" : (currentPlayerHand && !isTokenApprovedFor(currentPlayerHand.bet) ? "btn-warning" : "btn-success")) : "btn-disabled"}`}
+              title={!isLINKApproved ? "Click to approve LINK for Double Down" : currentPlayerHand && !isTokenApprovedFor(currentPlayerHand.bet) ? "Click to approve tokens for Double Down" : canDoubleDown ? "Double bet, get one card, then stand" : "Not available"}
+            >
+              {(isApprovingLINK || isApprovingToken) && pendingAction === "doubleDown" ? "Approving..." : 
+               isPending ? "Processing..." : 
+               !isLINKApproved ? "🔓 Double Down (Approve LINK)" : 
+               currentPlayerHand && !isTokenApprovedFor(currentPlayerHand.bet) ? "🔓 Double Down (Approve Tokens)" : 
+               "2️⃣ Double Down"}
+            </button>
+            <button
+              onClick={handleSplit}
+              disabled={!canSplit || isPending || isApprovingLINK || isApprovingToken || !!pendingAction || !!currentAction}
+              className={`btn ${canSplit && !isPending && !isApprovingLINK && !isApprovingToken && !pendingAction && !currentAction ? (!isLINKApproved ? "btn-warning" : (currentPlayerHand && !isTokenApprovedFor(currentPlayerHand.bet) ? "btn-warning" : "btn-success")) : "btn-disabled"}`}
+              title={!isLINKApproved ? "Click to approve LINK for Split" : currentPlayerHand && !isTokenApprovedFor(currentPlayerHand.bet) ? "Click to approve tokens for Split" : canSplit ? `Split matching cards into two hands (${playerHands.length}/4 hands)` : playerHands.length >= 4 ? "Maximum 4 hands reached" : "Not available"}
+            >
+              {(isApprovingLINK || isApprovingToken) && pendingAction === "split" ? "Approving..." : 
+               isPending ? "Processing..." : 
+               !isLINKApproved ? "🔓 Split (Approve LINK)" : 
+               currentPlayerHand && !isTokenApprovedFor(currentPlayerHand.bet) ? "🔓 Split (Approve Tokens)" : 
+               "✂️ Split"}
+            </button>
+          </div>
+          {/* LINK Fee Info */}
+          {linkFeePerAction && (
+            <div className="mt-3 text-center text-sm text-gray-300">
+              ℹ️ Each action requires <strong>{(Number(linkFeePerAction) / 1e18).toFixed(4)} LINK</strong> for VRF
+              {!isLINKApproved && (
+                <span className="text-yellow-300"> - Click any action to approve</span>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Surrender Button */}
+      {canSurrender && gameState !== GameState.Finished && !gameResult && (
+        <div className="mt-4">
+          <button
+            onClick={() => !isLINKApproved ? handleApproveLINK("surrender") : handleSurrender()}
+            disabled={isPending || isApprovingLINK}
+            className={`btn w-full btn-secondary`}
+            title={!isLINKApproved ? "Approve LINK first" : "Get half your bet back and end game"}
+          >
+            {isApprovingLINK && pendingAction === "surrender" ? "Approving..." : isPending && (pendingAction === "surrender" || currentAction === "surrender") ? "Surrendering..." : "🏳️ Surrender (Get Half Bet Back)"}
+          </button>
+        </div>
+      )}
+
+      {/* Transaction Status */}
+      {hash && (
+        <div className="mt-4 p-4 bg-green-600/20 rounded-lg">
+          <p className="text-green-400 break-all">
+            Transaction sent: {hash}
+          </p>
+        </div>
+      )}
+
+      {txError && (
+        <div className="mt-4 p-4 bg-red-600/20 rounded-lg border border-red-400">
+          <p className="text-red-400">
+            <strong>Error:</strong> {txError}
+          </p>
+        </div>
+      )}
+
+      {/* Waiting states */}
+      {pendingAction && (isTokenApproveSuccess || isApproveSuccess) && (
+        <div className="text-center p-6 bg-yellow-600/20 rounded-xl border border-yellow-400 mb-4">
+          <p className="text-xl font-semibold animate-pulse">⏳ Verifying approval and executing {pendingAction}...</p>
+          <p className="text-sm text-gray-300 mt-2">Please wait while we confirm your approval on the blockchain</p>
+        </div>
+      )}
+      
+      {state === GameState.Dealing && (
+        <div className="text-center p-6 bg-blue-600/20 rounded-xl border-2 border-blue-400">
+          <p className="text-2xl font-bold animate-pulse mb-2">🎲 Dealing cards...</p>
+          <p className="text-sm text-gray-300 mt-2">
+            Waiting for Chainlink VRF to provide randomness
+          </p>
+          <p className="text-xs text-gray-400 mt-1">
+            This usually takes 1-5 minutes on testnet
+          </p>
+          <VRFStatusDisplay gameAddress={gameAddress} />
+        </div>
+      )}
+
+      {state === GameState.DealerTurn && (
+        <div className="text-center p-6 bg-purple-600/20 rounded-xl border-2 border-purple-400">
+          <p className="text-xl font-semibold mb-4">🎰 Dealer's Turn</p>
+          <p className="text-sm text-gray-300">
+            {isPending && currentAction === "continueDealer" 
+              ? "⏳ Processing dealer's turn..." 
+              : isPending && currentAction === "dealerHit"
+              ? "⏳ Dealer is drawing a card..."
+              : "🎲 Dealer is playing..."}
+          </p>
+          {/* Debug buttons for manual testing - only show when not pending */}
+          {!isPending && (
+            <div className="flex gap-2 justify-center mt-3 opacity-60">
+              <button
+                onClick={() => execute("continueDealer")}
+                className="px-2 py-1 bg-purple-600 hover:bg-purple-700 rounded text-xs"
+              >
+                🔄 Continue (Debug)
+              </button>
+              <button
+                onClick={() => {
+                  if (!isLINKApproved) {
+                    handleApproveLINK("dealerHit");
+                  } else {
+                    execute("dealerHit");
+                  }
+                }}
+                className="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs"
+              >
+                🎲 Hit (Debug)
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {isFinished && (
+        <div className="text-center p-6 bg-yellow-600/20 rounded-xl border-2 border-yellow-400">
+          <p className="text-2xl font-bold mb-4">Game Over!</p>
+          {!gameResult && (
+            <div className="text-center p-4">
+              <p className="text-lg animate-pulse mb-2">📊 Loading game result...</p>
+              <p className="text-sm text-gray-300">Fetching outcome from blockchain</p>
+            </div>
+          )}
+          {gameResult && (() => {
+            // Use the pre-calculated result from gameResult to avoid race conditions
+            // This ensures the UI shows the correct result immediately
+            const result = gameResult.result;
+            
+            if (result === "blackjack") {
+              return <p className="text-4xl font-bold mb-2 text-yellow-300 animate-pulse">🃏 BLACKJACK! 🃏</p>;
+            } else if (result === "won") {
+              return <p className="text-3xl font-bold mb-2 text-green-400 animate-pulse">� Congratulations! You win! �</p>;
+            } else if (result === "push") {
+              return <p className="text-3xl font-bold mb-2 text-yellow-400 animate-pulse">🤝 It's a Push! 🤝</p>;
+            } else if (result === "insurance_payout") {
+              return <p className="text-3xl font-bold mb-2 text-blue-400 animate-pulse">🛡️ Insurance Paid Out! 🛡️</p>;
+            } else {
+              return <p className="text-3xl font-bold mb-2 text-red-400 animate-pulse">😔 Sorry! You lose! 😔</p>;
+            }
+          })()}
+          {gameResult && (
+            <div className="mt-4">
+              {(() => {
+                // Calculate total bet INCLUDING insurance
+                const totalMainBet = playerHands.reduce((sum, hand) => sum + Number(hand.bet), 0);
+                // Use contract insurance bet instead of state (more reliable)
+                const insurancePaid = contractInsuranceBet ? Number(contractInsuranceBet) : Number(placedInsuranceAmount);
+                const totalBet = totalMainBet + insurancePaid;
+                const payoutAmount = Number(gameResult.payout);
+                
+                console.log("🔍 DEBUG: Raw values before calculation");
+                console.log("  - contractInsuranceBet:", contractInsuranceBet?.toString());
+                console.log("  - placedInsuranceAmount:", placedInsuranceAmount.toString());
+                console.log("  - gameResult.payout:", gameResult.payout.toString());
+                console.log("  - totalMainBet:", totalMainBet);
+                console.log("  - insurancePaid:", insurancePaid);
+                console.log("  - totalBet:", totalBet);
+                console.log("  - payoutAmount:", payoutAmount);
+                
+                // Check if dealer has blackjack by looking at their cards
+                const dealerHasBlackjack = dealerCards.length === 2 && 
+                  (() => {
+                    const cards = dealerCards.map(c => Number(c));
+                    const hasAce = cards.some(c => c % 13 === 1);
+                    const hasTen = cards.some(c => {
+                      const rank = c % 13;
+                      // rank 0 = King (13), rank 1 = Ace, rank 10 = 10, rank 11 = Jack, rank 12 = Queen
+                      return rank === 10 || rank === 11 || rank === 12 || rank === 0;
+                    });
+                    const result = hasAce && hasTen;
+                    console.log("🃏 Dealer blackjack check:", { cards, hasAce, hasTen, result, dealerCardsLength: dealerCards.length });
+                    return result;
+                  })();
+                
+                // Check if this was an insurance scenario
+                const hadInsurance = insurancePaid > 0;
+                const insurancePayout = hadInsurance ? (insurancePaid * 3) : 0;
+                
+                // CRITICAL FIX: Detect insurance scenario in multiple ways to ensure we catch it
+                // Method 1: Dealer has blackjack AND we had insurance
+                const isInsuranceScenarioMethod1 = dealerHasBlackjack && hadInsurance;
+                
+                // Method 2: We had insurance AND payout matches insurance payout pattern
+                // If insurance paid out, the payout should be exactly insurancePayout (3x insurance bet)
+                // OR it could be insurancePayout + any main hand winnings
+                // But if dealer has blackjack, main hand always loses, so payout should equal insurancePayout
+                const expectedInsurancePayout = insurancePayout;
+                const isInsuranceScenarioMethod2 = hadInsurance && payoutAmount === expectedInsurancePayout;
+                
+                // Method 3: We had insurance AND payout is close to 3x insurance (allowing for rounding)
+                const isInsuranceScenarioMethod3 = hadInsurance && payoutAmount > 0 && 
+                  Math.abs(payoutAmount - expectedInsurancePayout) < 1e15; // Within 0.001 BJT
+                
+                // Use OR of all methods to ensure we catch all insurance scenarios
+                const isInsuranceScenario = isInsuranceScenarioMethod1 || isInsuranceScenarioMethod2 || isInsuranceScenarioMethod3;
+                
+                console.log("📊 Result calculation:", {
+                  totalMainBet: (totalMainBet / 1e18).toFixed(2),
+                  insurancePaid: (insurancePaid / 1e18).toFixed(2),
+                  totalBet: (totalBet / 1e18).toFixed(2),
+                  payoutAmount: (payoutAmount / 1e18).toFixed(2),
+                  dealerHasBlackjack,
+                  hadInsurance,
+                  isInsuranceScenarioMethod1,
+                  isInsuranceScenarioMethod2,
+                  isInsuranceScenarioMethod3,
+                  isInsuranceScenario,
+                  dealerCardsCount: dealerCards.length,
+                  placedInsuranceAmountState: (Number(placedInsuranceAmount) / 1e18).toFixed(2),
+                  insurancePayout: (insurancePayout / 1e18).toFixed(2),
+                  expectedInsurancePayout: (expectedInsurancePayout / 1e18).toFixed(2),
+                  comparison: {
+                    payoutVsTotalBet: payoutAmount === totalBet ? "EQUAL" : payoutAmount > totalBet ? "PAYOUT > TOTAL" : "PAYOUT < TOTAL",
+                    payoutVsMainBet: payoutAmount === totalMainBet ? "EQUAL" : payoutAmount > totalMainBet ? "PAYOUT > MAIN" : "PAYOUT < MAIN",
+                    payoutVsInsurancePayout: payoutAmount === expectedInsurancePayout ? "EQUAL" : payoutAmount > expectedInsurancePayout ? "PAYOUT > INSURANCE" : "PAYOUT < INSURANCE"
+                  }
+                });
+                
+                // Check if player has blackjack (natural 21 with 2 cards)
+                const hasPlayerBlackjack = playerHands.some(hand => {
+                  if (hand.cards.length !== 2) return false;
+                  const cards = hand.cards.map(c => Number(c));
+                  const hasAce = cards.some(c => c % 13 === 1);
+                  const hasTen = cards.some(c => {
+                    const rank = c % 13;
+                    return rank === 10 || rank === 11 || rank === 12 || rank === 0; // 10, J, Q, K
+                  });
+                  return hasAce && hasTen;
+                });
+                
+                // Calculate profit ratio to detect blackjack payout (1.5x bet = 3:2 payout)
+                const profit = payoutAmount - totalBet;
+                const profitRatio = totalBet > 0 ? profit / totalBet : 0;
+                const isBlackjackPayout = hasPlayerBlackjack && profitRatio >= 1.4 && profitRatio <= 1.6; // Around 1.5x
+                
+                // Determine actual result
+                let actualResult = "lost";
+                let resultColor = "text-red-400";
+                
+                // IMPORTANT: Check insurance scenario FIRST before other results
+                // This ensures we NEVER show "WON" when it's an insurance scenario
+                if (isInsuranceScenario) {
+                  // Insurance scenario: dealer had blackjack, insurance paid out
+                  console.log("✅ Result: INSURANCE PAYOUT (insurance scenario detected)");
+                  actualResult = "insurance_payout";
+                  resultColor = "text-blue-400";
+                } else if (isBlackjackPayout) {
+                  console.log("✅ Result: BLACKJACK! (player has natural blackjack with 3:2 payout)");
+                  actualResult = "blackjack";
+                  resultColor = "text-yellow-400";
+                } else if (payoutAmount > totalBet) {
+                  console.log("✅ Result: WON (payout > totalBet)");
+                  actualResult = "won";
+                  resultColor = "text-green-400";
+                } else if (payoutAmount === totalBet) {
+                  console.log("✅ Result: PUSH (payout === totalBet)");
+                  actualResult = "push";
+                  resultColor = "text-yellow-400";
+                } else {
+                  console.log("✅ Result: LOST (payout < totalBet or 0)");
+                }
+                
+                
+                return (
+                  <>
+                    <div className="mb-4 p-3 bg-black/40 rounded-lg">
+                      <p className="text-sm text-gray-400">Main Bet Amount</p>
+                      <p className="text-2xl font-bold text-white">
+                        {(totalMainBet / 1e18).toFixed(2)} BJT
+                      </p>
+                      {insurancePaid > 0 && (
+                        <>
+                          <p className="text-sm text-gray-400 mt-2">Insurance Bet</p>
+                          <p className="text-xl font-semibold text-blue-300">
+                            +{(insurancePaid / 1e18).toFixed(2)} BJT
+                          </p>
+                          <div className="border-t border-gray-600 mt-2 pt-2">
+                            <p className="text-sm text-gray-400">Total Amount Paid</p>
+                            <p className="text-2xl font-bold text-yellow-300">
+                              {(totalBet / 1e18).toFixed(2)} BJT
+                            </p>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                    {payoutAmount > 0 ? (
+                      <div className={`border rounded-lg p-4 ${
+                        actualResult === "blackjack"
+                          ? "bg-yellow-600/30 border-yellow-400"
+                          : actualResult === "won" 
+                          ? "bg-green-600/30 border-green-400" 
+                          : actualResult === "push"
+                          ? "bg-yellow-600/30 border-yellow-400"
+                          : actualResult === "insurance_payout"
+                          ? "bg-blue-600/30 border-blue-400"
+                          : "bg-gray-600/30 border-gray-400"
+                      }`}>
+                        <p className={`text-lg font-bold ${
+                          actualResult === "blackjack"
+                            ? "text-yellow-300"
+                            : actualResult === "won" 
+                            ? "text-green-300" 
+                            : actualResult === "push"
+                            ? "text-yellow-300"
+                            : actualResult === "insurance_payout"
+                            ? "text-blue-300"
+                            : "text-gray-300"
+                        }`}>
+                          {actualResult === "blackjack" && "🃏 BLACKJACK! 3:2 Payout!"}
+                          {actualResult === "won" && "💰 You Won!"}
+                          {actualResult === "push" && "🤝 Push - Tie Game"}
+                          {actualResult === "insurance_payout" && "🛡️ Insurance Protected You!"}
+                          {actualResult === "lost" && "💸 Bet Lost"}
+                        </p>
+                        {(actualResult === "won" || actualResult === "blackjack") && (
+                          <>
+                            <p className="text-2xl font-bold text-green-400 mt-3">
+                              +{((payoutAmount - totalBet) / 1e18).toFixed(2)} BJT
+                            </p>
+                            <p className="text-sm text-gray-400 mt-1">
+                              Net Profit {actualResult === "blackjack" ? "(3:2 Blackjack)" : ""}
+                            </p>
+                          </>
+                        )}
+                        {actualResult === "insurance_payout" && (
+                          <>
+                            <div className="mt-3 space-y-2">
+                              <div className="bg-red-900/30 rounded p-3 border border-red-400/50">
+                                <p className="text-sm text-red-200 font-semibold">⚠️ Dealer had Blackjack</p>
+                                <p className="text-base text-red-300 mt-1">Main bet lost: -{(totalMainBet / 1e18).toFixed(2)} BJT</p>
+                              </div>
+                              <div className="bg-blue-900/40 rounded p-3 border border-blue-400/50">
+                                <p className="text-sm text-blue-200 font-semibold">🛡️ Insurance paid 2:1</p>
+                                <p className="text-base text-blue-300 mt-1">
+                                  Insurance return: +{(insurancePayout / 1e18).toFixed(2)} BJT
+                                </p>
+                                <p className="text-xs text-blue-200 mt-1 italic">
+                                  (3x your {(insurancePaid / 1e18).toFixed(2)} BJT insurance bet)
+                                </p>
+                              </div>
+                              <div className="bg-yellow-900/30 rounded p-3 border border-yellow-400/50">
+                                <p className="text-sm text-yellow-200 font-semibold">💰 Final Result</p>
+                                <p className="text-2xl font-bold text-yellow-300 mt-1">
+                                  {payoutAmount === totalBet ? "±0.00 BJT" : 
+                                   payoutAmount > totalBet ? `+${((payoutAmount - totalBet) / 1e18).toFixed(2)} BJT` :
+                                   `${((payoutAmount - totalBet) / 1e18).toFixed(2)} BJT`}
+                                </p>
+                                <p className="text-xs text-yellow-200 mt-1">
+                                  {payoutAmount === totalBet ? "Break even - insurance covered your loss!" : 
+                                   payoutAmount > totalBet ? "Profit - insurance paid more than you lost!" :
+                                   "Reduced loss - insurance helped recover some of your bet"}
+                                </p>
+                              </div>
+                            </div>
+                            <p className="text-xs text-blue-300 mt-3 p-2 bg-blue-900/20 rounded border border-blue-400/30 italic">
+                              💡 Insurance is a side bet that pays when the dealer has Blackjack. It costs half your main bet and pays 2:1 (returns 3x your insurance), helping you recover losses when the dealer gets lucky!
+                            </p>
+                          </>
+                        )}
+                        {actualResult === "push" && (
+                          <p className="text-xl font-semibold text-yellow-300 mt-2">
+                            {(totalBet / 1e18).toFixed(2)} BJT (bet returned)
+                          </p>
+                        )}
+                        <p className="text-sm text-gray-300 mt-2 border-t border-gray-600 pt-2">
+                          Total Payout: {(payoutAmount / 1e18).toFixed(2)} BJT
+                        </p>
+                        <p className="text-xs text-gray-300 mt-1">
+                          (Automatically transferred to your wallet)
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="bg-red-600/30 border border-red-400 rounded-lg p-4">
+                        <p className="text-lg font-bold text-red-300">
+                          No payout - Better luck next time!
+                        </p>
+                        <p className="text-sm text-gray-300 mt-1">
+                          Lost: {(totalBet / 1e18).toFixed(2)} BJT
+                        </p>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          )}
+        </div>
+      )}
+      </div>
+    </div>
+  );
+}

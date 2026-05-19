@@ -1,0 +1,44 @@
+# Compiler files
+cache/
+out/
+
+# Ignores development broadcast logs
+!/broadcast
+/broadcast/*/31337/
+/broadcast/**/dry-run/
+
+# Docs
+docs/
+
+# Logs
+logs/
+
+# Dotenv files
+.env
+.env.*
+!.env.example
+frontend/.env.*
+!frontend/.env.template
+
+# Backup files
+*.bak
+*.bak2
+
+# Frontend (Next.js)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.vercel/
+frontend/*.tsbuildinfo
+frontend/.DS_Store
+frontend/*.log
+
+# OS files
+.DS_Store
+*.pem
+
+# Foundry dependencies
+lib/
+cache/
+out/

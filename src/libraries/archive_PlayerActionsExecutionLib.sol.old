@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import {IGameToken} from "../interfaces/IGameToken.sol";
+import {GameUpgradeable} from "../GameUpgradeable.sol";
+import {PlayerActionsLogic} from "./PlayerActionsLogic.sol";
+import {PlayerActionValidation} from "./PlayerActionValidation.sol";
+import {VRFRequestHelper} from "./VRFRequestHelper.sol";
+import {IVRFCoordinatorV2Plus} from "lib/foundry-chainlink-toolkit/lib/chainlink-brownie-contracts/contracts/src/v0.8/dev/interfaces/IVRFCoordinatorV2Plus.sol";
+
+// Custom errors
+error NotYourGame();
+error NotPlayerTurn();
+error HandAlreadyStood();
+
+library PlayerActionsExecutionLib {
+    
+    function executeHit(
+        address player,
+        address msgSender,
+        uint8 gameState,
+        uint8 currentHand,
+        GameUpgradeable.Hand[] storage playerHands,
+        mapping(uint256 => GameUpgradeable.RequestType) storage pendingRequests,
+        mapping(uint256 => uint256) storage requestTimestamps,
+        address linkAddress,
+        IVRFCoordinatorV2Plus vrfCoordinator,
+        uint256 subscriptionId
+    ) external returns (uint256 newRequestId, uint256 linkFee) {
+        PlayerActionValidation.validatePlayer(player, msgSender);
+        PlayerActionValidation.validatePlayerTurn(gameState);
+        PlayerActionsLogic.validateHit(gameState, currentHand, playerHands);
+        
+        (newRequestId, linkFee) = VRFRequestHelper.requestVRF(player, linkAddress, vrfCoordinator, subscriptionId);
+        
+        pendingRequests[newRequestId] = GameUpgradeable.RequestType.PlayerHit;
+        requestTimestamps[newRequestId] = block.timestamp;
+    }
+    
+    function executeStand(
+        address player,
+        address msgSender,
+        uint8 gameState,
+        uint8 currentHand,
+        GameUpgradeable.Hand[] storage playerHands
+    ) external returns (uint8 nextHand, bool moveToDealerTurn) {
+        if (msgSender != player) revert NotYourGame();
+        if (gameState != uint8(GameUpgradeable.GameState.PlayerTurn)) revert NotPlayerTurn();
+        if (playerHands[currentHand].stood) revert HandAlreadyStood();
+
+        playerHands[currentHand].stood = true;
+        return PlayerActionsLogic.processStand(currentHand, playerHands);
+    }
+    
+    function executeDoubleDown(
+        address player,
+        address msgSender,
+        uint8 gameState,
+        uint8 currentHand,
+        GameUpgradeable.Hand[] storage playerHands,
+        IGameToken gameToken,
+        mapping(uint256 => GameUpgradeable.RequestType) storage pendingRequests,
+        mapping(uint256 => uint256) storage requestTimestamps,
+        address linkAddress,
+        IVRFCoordinatorV2Plus vrfCoordinator,
+        uint256 subscriptionId
+    ) external returns (uint256 newRequestId, uint256 linkFee, uint256 additionalBet) {
+        if (msgSender != player) revert NotYourGame();
+        additionalBet = PlayerActionsLogic.validateDoubleDown(gameState, currentHand, playerHands);
+        
+        require(gameToken.transferFrom(player, address(this), additionalBet), "Bet transfer failed");
+        PlayerActionsLogic.applyDoubleDown(currentHand, playerHands, additionalBet);
+
+        (newRequestId, linkFee) = VRFRequestHelper.requestVRF(player, linkAddress, vrfCoordinator, subscriptionId);
+        
+        pendingRequests[newRequestId] = GameUpgradeable.RequestType.PlayerHit;
+        requestTimestamps[newRequestId] = block.timestamp;
+    }
+    
+    function executeSplit(
+        address player,
+        address msgSender,
+        uint8 gameState,
+        uint8 currentHand,
+        GameUpgradeable.Hand[] storage playerHands,
+        IGameToken gameToken,
+        mapping(uint256 => GameUpgradeable.RequestType) storage pendingRequests,
+        mapping(uint256 => uint256) storage requestTimestamps,
+        address linkAddress,
+        IVRFCoordinatorV2Plus vrfCoordinator,
+        uint256 subscriptionId
+    ) external returns (uint256 newRequestId, uint256 linkFee) {
+        if (msgSender != player) revert NotYourGame();
+        (uint8 card1, uint8 card2, uint256 splitBet) = PlayerActionsLogic.validateSplit(gameState, currentHand, playerHands);
+        
+        require(gameToken.transferFrom(player, address(this), splitBet), "Split bet transfer failed");
+        PlayerActionsLogic.executeSplitLogic(currentHand, playerHands, card1, card2, splitBet);
+
+        (newRequestId, linkFee) = VRFRequestHelper.requestVRF(player, linkAddress, vrfCoordinator, subscriptionId);
+        
+        pendingRequests[newRequestId] = GameUpgradeable.RequestType.Split;
+        requestTimestamps[newRequestId] = block.timestamp;
+    }
+}
