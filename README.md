@@ -1,136 +1,69 @@
 # Polygon Blackjack
 
-A fully on-chain blackjack game deployed on Polygon Amoy testnet. Uses Chainlink VRF for provably fair card randomness, an upgradeable proxy architecture, and a custom ERC20 token backed by POL.
+A fully on-chain blackjack game deployed on Polygon Amoy testnet. Card randomness is verifiable on-chain via Chainlink VRF. The frontend is built in Next.js and interacts with the contracts directly from the browser using wagmi and viem.
 
 ## Live Demo
 
-Frontend: [polygon-blackjack.vercel.app](https://polygon-blackjack.vercel.app)
-
-## Architecture
-
-### Smart Contracts (Foundry)
-
-```
-src/
-├── GameUpgradeable.sol          # Main game logic (upgradeable proxy)
-├── GameFactoryUpgradeable.sol   # Factory for creating and managing games
-├── GameImplementation.sol       # Implementation contract
-├── GameKeeperAutomation.sol     # Chainlink Keeper automation for dealer logic
-├── GameToken.sol                # ERC20 game token (POL-backed, 1000 tokens per POL)
-└── libraries/
-    ├── CardLogic.sol            # Card dealing and deck management
-    ├── DealerLogic.sol          # Dealer hand progression
-    ├── VRFRequestLogic.sol      # Chainlink VRF request handling
-    ├── VRFFulfillmentLogic.sol  # VRF response fulfillment
-    ├── HandProgressionLogic.sol # Hit, stand, double, split, insurance
-    ├── WinnerDeterminationLogic.sol
-    └── ...
-```
-
-### Frontend (Next.js)
-
-```
-frontend/
-├── src/
-│   ├── components/
-│   │   ├── GamePlay.tsx         # Main game UI
-│   │   ├── PlayingCard.tsx      # Card rendering
-│   │   ├── CreateGame.tsx       # Game creation flow
-│   │   ├── BuyTokens.tsx        # Token purchase
-│   │   ├── ConnectWallet.tsx    # Wallet connection
-│   │   └── VRFStatusDisplay.tsx # VRF request status
-│   ├── hooks/
-│   │   ├── useGameTransaction.ts
-│   │   └── useVRFStatus.ts
-│   └── wagmi.ts                 # Wallet config
-```
+[polygon-blackjack.vercel.app](https://polygon-blackjack.vercel.app)
 
 ## How It Works
 
-1. Player connects a MetaMask wallet and buys game tokens (1 POL = 1000 tokens)
-2. A new game instance is deployed via the factory contract
-3. Player places a bet and starts a hand
-4. The contract requests randomness from Chainlink VRF to deal cards
-5. Player actions (hit, stand, double down, split, insurance) trigger further VRF requests as needed
-6. Chainlink Keepers automate the dealer hand after the player stands
-7. Winner is determined on-chain and tokens are paid out
+Players connect a MetaMask wallet, buy game tokens with POL, and play blackjack against a dealer whose actions are automated by Chainlink Keepers. Every hand of cards is dealt using randomness from Chainlink VRF V2.5 — the randomness request and fulfillment are recorded on-chain, making the outcome independently verifiable.
 
-## Key Design Decisions
+## Contract Architecture
 
-**Chainlink VRF V2.5** — All card randomness is verifiable on-chain. No pseudorandom shortcuts.
+The system has three main pieces: a factory, individual game contracts, and a token.
 
-**Upgradeable Proxy Pattern** — Game logic can be upgraded without redeploying or migrating funds.
+**Factory** is a UUPS upgradeable proxy that owns the Chainlink VRF subscription and holds the LINK tokens needed to pay for randomness. When a player starts a game, the factory deploys a new game contract using the minimal proxy clone pattern (EIP-1167) — a cheap copy of a master implementation that delegates all logic to it. This means deploying a new game costs very little gas. Individual game contracts are not upgradeable themselves; they are ephemeral and exist only for the duration of a game.
 
-**Library Architecture** — Game logic is split across ~20 libraries to stay within the contract size limit (24KB).
+Because individual game clones can't hold a VRF subscription directly, they route all randomness requests through the factory. The factory holds the subscription, makes the VRF request to Chainlink on the game's behalf, and forwards the random words back when Chainlink responds. This keeps subscription management centralized while allowing any number of concurrent games.
 
-**POL-backed Token** — GameToken has no initial supply. Every token in circulation is backed 1:1000 by POL, redeemable at any time.
+**Game contracts** handle the full blackjack ruleset: hit, stand, double down, split, insurance, and surrender. Each player action that requires new cards triggers a VRF request. The game logic is split across roughly 20 Solidity libraries to stay within the 24KB contract size limit imposed by the EVM. Dealer hand progression runs automatically via Chainlink Automation — once a player stands, a Keeper picks it up and completes the dealer's hand without any manual transaction.
 
-**Chainlink Automation** — Dealer hand progression runs automatically via Keeper contracts, no manual triggering needed.
+**GameToken** is an ERC20 token backed by POL at a fixed rate of 1000 tokens per POL. There is no initial supply — every token in circulation was minted by someone depositing POL. Tokens can be redeemed for POL at the same rate at any time, with no fees in either direction. This means the contract always holds enough POL to cover all outstanding tokens.
 
 ## Test Suite
 
-20+ test files covering the full game lifecycle:
+The test suite covers the full game lifecycle including edge cases that are easy to miss in manual testing:
 
-- `Game.t.sol` — Core game flow
-- `VRFFailureRetry.t.sol` — VRF failure and retry handling
-- `InsuranceDoubleDown.t.sol` — Insurance and double down logic
-- `ConcurrentPlayers.t.sol` — Multiple simultaneous games
-- `EmergencyWithdrawal.t.sol` — Emergency fund recovery
-- `GameKeeperAutomation.t.sol` — Keeper automation
-- `UpgradeScript.t.sol` — Proxy upgrade flow
-- `LinkAccounting.t.sol` — LINK token accounting
-- `GasComparison.t.sol` — Gas benchmarks
+- Core game flow and hand progression
+- VRF failure and retry handling
+- Concurrent players running simultaneous games
+- Insurance and double down combinations
+- Emergency fund withdrawal
+- Chainlink Keeper automation
+- Proxy upgrade flow
+- LINK token accounting
+- Gas benchmarks across different action types
 
 ## Getting Started
 
-### Prerequisites
-
-- [Foundry](https://getfoundry.sh/)
-- [Node.js 18+](https://nodejs.org/)
-- MetaMask with Polygon Amoy testnet configured
-- Alchemy or Infura RPC URL
-
 ### Smart Contracts
 
+Requires [Foundry](https://getfoundry.sh/).
+
 ```bash
-# Install dependencies
 forge install
-
-# Run tests
 forge test
-
-# Deploy (copy .env.example to .env and fill in values)
-cp .env.example .env
-forge script deployment-scripts/Deploy.s.sol --rpc-url $POLYGON_AMOY_RPC_URL --broadcast
 ```
+
+To deploy, copy `.env.example` to `.env`, fill in your RPC URL, private key, and Chainlink config, then run the deployment scripts in `deployment-scripts/`.
 
 ### Frontend
 
 ```bash
 cd frontend
 npm install
-
-# Copy template and fill in deployed contract addresses
-cp .env.template .env.local
-
+cp .env.template .env.local  # fill in deployed contract addresses
 npm run dev
 ```
 
-## Deployed Contracts (Polygon Amoy)
-
-| Contract | Address |
-|----------|---------|
-| Factory Proxy | see `.env.example` |
-| Game Token | see `.env.example` |
-| VRF Coordinator | `0x343300b5d84D444B2ADc9116FEF1bED02BE49Cf2` |
-
 ## Tech Stack
 
-- **Solidity ^0.8.30** — Smart contracts
-- **Foundry** — Testing and deployment
-- **Chainlink VRF V2.5** — Verifiable randomness
-- **Chainlink Automation** — Keeper automation
-- **OpenZeppelin** — Upgradeable proxy, ERC20, ReentrancyGuard
-- **Next.js + TypeScript** — Frontend
-- **wagmi + viem** — Wallet and contract interaction
-- **Tailwind CSS** — Styling
+- **Solidity ^0.8.30** + **Foundry** — contracts and testing
+- **Chainlink VRF V2.5** — verifiable on-chain randomness
+- **Chainlink Automation** — automated dealer logic
+- **OpenZeppelin** — UUPS proxy, ERC20, ReentrancyGuard, EIP-1167 clones
+- **Next.js + TypeScript** — frontend
+- **wagmi + viem** — wallet connection and contract interaction
+- **Tailwind CSS** — styling
